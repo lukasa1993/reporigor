@@ -909,12 +909,12 @@ impl RunLockGuard {
                     });
                 }
                 Err(error)
-                    if error.kind() == ErrorKind::WouldBlock
+                    if lock_is_contended(&error)
                         && deadline.is_some_and(|deadline| Instant::now() < deadline) =>
                 {
                     std::thread::sleep(LOCK_RETRY_INTERVAL);
                 }
-                Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                Err(error) if lock_is_contended(&error) => {
                     return Err(MutationError::AlreadyRunning { path });
                 }
                 Err(source) => return Err(MutationError::io("acquire run lock", path, source)),
@@ -924,6 +924,22 @@ impl RunLockGuard {
 
     pub(crate) fn state(&self) -> &Path {
         &self.state
+    }
+}
+
+fn lock_is_contended(error: &std::io::Error) -> bool {
+    if error.kind() == ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // LockFileEx reports lock or sharing violations as raw Win32 errors
+        // instead of mapping them to ErrorKind::WouldBlock.
+        matches!(error.raw_os_error(), Some(32) | Some(33))
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -2439,6 +2455,13 @@ mod tests {
         drop(first);
         RunLockGuard::acquire_with_base(&root, state_base.path())?;
         Ok(())
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lock_violations_are_classified_as_contention() {
+        assert!(lock_is_contended(&std::io::Error::from_raw_os_error(32)));
+        assert!(lock_is_contended(&std::io::Error::from_raw_os_error(33)));
     }
 
     #[test]

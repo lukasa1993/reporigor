@@ -193,7 +193,7 @@ fn legacy_coverage_refuses_a_crash_journal_before_running_commands() -> Result<(
     fs::write(&source, ORIGINAL_SOURCE)?;
 
     let test_command = "grep -q '^    if value <= 0:$' src/main.py || exit 91; \
-         printf '%s\n' \"$$\" > command-group.pid; printf 'ready\n' > mutation-ready; sleep 30";
+         printf '%s\n' \"$$\" > command-group.pid; printf 'ready\n' > mutation-ready; exec sleep 30";
     let child = Command::new(env!("CARGO_BIN_EXE_reporigor"))
         .args([
             "--backend",
@@ -234,7 +234,7 @@ fn legacy_coverage_refuses_a_crash_journal_before_running_commands() -> Result<(
         crash_status.code().is_none(),
         "forced crash unexpectedly returned {crash_status}"
     );
-    terminate_group(command_group);
+    send_signal("KILL", command_group)?;
     wait_for_process_exit(command_group, Duration::from_secs(2))?;
     let _ = child.read_output()?;
 
@@ -551,14 +551,6 @@ fn wait_for_process_exit(pid: u32, timeout: Duration) -> io::Result<()> {
         thread::sleep(Duration::from_millis(10));
     }
     Ok(())
-}
-
-fn terminate_group(group: u32) {
-    let _ = Command::new("/bin/kill")
-        .args(["-KILL", &format!("-{group}")])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status();
 }
 
 fn read_pid(path: &Path) -> io::Result<u32> {

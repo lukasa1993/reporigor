@@ -3,7 +3,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 
-use analysis_mutate::MutationMode;
+use analysis_mutate::{MutationMode, STATE_DIRECTORY_ENV};
 use reporigor_reporting::{ReportCommand, ReportEnvelope};
 
 const GENERIC_LANGUAGES: [(&str, &str); 8] = [
@@ -608,8 +608,11 @@ fn command_arguments(
 }
 
 fn run_cli(arguments: &[OsString]) -> Output {
+    let state_parent =
+        tempfile::tempdir().unwrap_or_else(|error| panic!("failed to create isolated CLI state: {error}"));
     match Command::new(env!("CARGO_BIN_EXE_reporigor"))
         .args(arguments)
+        .env(STATE_DIRECTORY_ENV, state_parent.path())
         .stdin(Stdio::null())
         .output()
     {

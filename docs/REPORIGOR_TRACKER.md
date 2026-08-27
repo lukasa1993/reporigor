@@ -641,12 +641,20 @@ clearance or a permanent reservation; publication must repeat the checks.
   published.
 - Used the first clean GitHub Actions run as a portability audit and fixed four
   issues it exposed: macOS rustup shims resolving through `rustup-init`, Linux
-  container zombies confusing cancellation assertions, Windows same-process
-  file-lock semantics, and legacy CLI tests sharing user-level state.
+  container process/zombie cleanup confusing cancellation assertions, Windows
+  same-process file-lock semantics, and legacy CLI tests sharing user-level
+  state.
 - Added focused regressions, repeated the formerly racy legacy and cancellation
   tests five times, and passed formatting, strict Clippy, the complete current
   and Rust 1.82 suites, Windows-target compilation, and RepoRigor dogfood with
   zero findings before the corrective push.
+- The follow-up matrix exposed two remaining fixture assumptions: GNU `kill`
+  parsing for negative process IDs and parallel E2E commands sharing default
+  machine state on Windows. Made crash cleanup use a recorded positive PID,
+  isolated every E2E subprocess, and normalized Win32 lock/sharing violations
+  to the stable contention error. The focused E2E and crash cases then passed
+  repeatedly on both toolchains, followed by both full suites and zero-finding
+  dogfood.
 
 ## Next action
 
