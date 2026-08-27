@@ -665,6 +665,8 @@ clearance or a permanent reservation; publication must repeat the checks.
   [`33111067417`](https://github.com/lukasa1993/reporigor/actions/runs/33111067417)
   then passed dependency policy, format/lint/docs/dogfood, Rust 1.82, and the
   complete Linux, macOS, and Windows test matrix.
+- Added the canonical full repository URL to the copy-ready agent prompt so it
+  remains self-contained when pasted outside this repository.
 
 ## Next action
 

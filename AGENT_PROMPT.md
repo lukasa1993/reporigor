@@ -1,5 +1,7 @@
 # RepoRigor agent prompt
 
+> RepoRigor: https://github.com/lukasa1993/reporigor
+>
 > Use RepoRigor as the final gate for every code change. Run
 > `reporigor --backend generic check <source-root>`; in the RepoRigor repository,
 > run `scripts/dogfood`. Use native mode only on trusted code with
