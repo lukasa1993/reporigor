@@ -4,11 +4,22 @@ use std::time::{Duration, Instant};
 #[cfg(windows)]
 use std::io::Read;
 #[cfg(windows)]
+use std::path::{Path, PathBuf};
+#[cfg(windows)]
 use std::sync::mpsc;
 
 use reporigor_process_tree::{CleanupPolicy, ProcessTree, WaitReason};
 #[cfg(unix)]
 use reporigor_process_tree::{CleanupStage, PollResult};
+
+#[cfg(windows)]
+const WINDOWS_HELPER_ROLE_ENV: &str = "REPORIGOR_PROCESS_TREE_TEST_ROLE";
+#[cfg(windows)]
+const WINDOWS_HELPER_READY_ENV: &str = "REPORIGOR_PROCESS_TREE_TEST_READY";
+#[cfg(windows)]
+const WINDOWS_HELPER_MARKER_ENV: &str = "REPORIGOR_PROCESS_TREE_TEST_MARKER";
+#[cfg(windows)]
+const WINDOWS_HELPER_TEST: &str = "windows_job_helper";
 
 fn fast_cleanup() -> CleanupPolicy {
     CleanupPolicy {
@@ -214,16 +225,8 @@ fn windows_leader_exit_closes_descendant_pipe_and_prevents_marker() -> Result<()
     let directory = tempfile::tempdir()?;
     let marker = directory.path().join("leaked-after-exit");
     let ready = directory.path().join("descendant-ready");
-    let script = concat!(
-        "start \"\" /B cmd.exe /D /S /C ",
-        "\"echo ready>descendant-ready & ping -n 2 127.0.0.1 >NUL & ",
-        "echo inherited-output & ",
-        "echo leaked>leaked-after-exit\" & exit /B 7"
-    );
-    let mut command = Command::new("cmd.exe");
+    let mut command = windows_helper_command("exit-leader", &ready, &marker)?;
     command
-        .args(["/D", "/S", "/C", script])
-        .current_dir(directory.path())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
@@ -248,16 +251,8 @@ fn windows_timeout_kills_background_descendant_before_marker() -> Result<(), Box
     let directory = tempfile::tempdir()?;
     let marker = directory.path().join("leaked-after-timeout");
     let ready = directory.path().join("descendant-ready");
-    let script = concat!(
-        "start \"\" /B cmd.exe /D /S /C ",
-        "\"echo ready>descendant-ready & ping -n 2 127.0.0.1 >NUL & ",
-        "echo leaked>leaked-after-timeout\" ",
-        "& ping -n 30 127.0.0.1 >NUL"
-    );
-    let mut command = Command::new("cmd.exe");
+    let mut command = windows_helper_command("timeout-leader", &ready, &marker)?;
     command
-        .args(["/D", "/S", "/C", script])
-        .current_dir(directory.path())
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -269,6 +264,65 @@ fn windows_timeout_kills_background_descendant_before_marker() -> Result<(), Box
     std::thread::sleep(Duration::from_millis(1_300));
     assert!(!marker.exists(), "Job Object descendant wrote after timeout");
     Ok(())
+}
+
+#[cfg(windows)]
+#[test]
+fn windows_job_helper() -> Result<(), Box<dyn std::error::Error>> {
+    let Some(role) = std::env::var_os(WINDOWS_HELPER_ROLE_ENV) else {
+        return Ok(());
+    };
+    let ready = required_helper_path(WINDOWS_HELPER_READY_ENV)?;
+    let marker = required_helper_path(WINDOWS_HELPER_MARKER_ENV)?;
+    match role.to_string_lossy().as_ref() {
+        "descendant" => {
+            std::fs::write(&ready, b"ready")?;
+            std::thread::sleep(Duration::from_millis(750));
+            std::fs::write(marker, b"leaked")?;
+        }
+        role @ ("exit-leader" | "timeout-leader") => {
+            let mut descendant = windows_helper_command("descendant", &ready, &marker)?;
+            let _descendant = descendant
+                .stdin(Stdio::null())
+                .stdout(Stdio::inherit())
+                .stderr(Stdio::null())
+                .spawn()?;
+            wait_for_path(&ready, Duration::from_secs(5))?;
+            if role == "exit-leader" {
+                std::process::exit(7);
+            }
+            std::thread::sleep(Duration::from_secs(30));
+        }
+        role => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("unknown Windows Job Object helper role: {role}"),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn windows_helper_command(role: &str, ready: &Path, marker: &Path) -> std::io::Result<Command> {
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args(["--exact", WINDOWS_HELPER_TEST, "--nocapture"])
+        .env(WINDOWS_HELPER_ROLE_ENV, role)
+        .env(WINDOWS_HELPER_READY_ENV, ready)
+        .env(WINDOWS_HELPER_MARKER_ENV, marker);
+    Ok(command)
+}
+
+#[cfg(windows)]
+fn required_helper_path(variable: &str) -> std::io::Result<PathBuf> {
+    std::env::var_os(variable).map(PathBuf::from).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("Windows Job Object helper is missing {variable}"),
+        )
+    })
 }
 
 #[cfg(windows)]

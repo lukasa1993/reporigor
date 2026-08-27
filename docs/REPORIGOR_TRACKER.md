@@ -655,6 +655,12 @@ clearance or a permanent reservation; publication must repeat the checks.
   to the stable contention error. The focused E2E and crash cases then passed
   repeatedly on both toolchains, followed by both full suites and zero-finding
   dogfood.
+- Once those suites advanced farther on Windows, they exposed an older Job
+  Object fixture whose nested `cmd.exe start /C` quoting never launched its
+  descendant. Replaced the shell fixture with the Rust test executable spawning
+  itself as leader and descendant, directly exercising inherited Job Object
+  cleanup. The replacement compiles for the Windows target and passes local
+  process-tree lint, tests, and RepoRigor dogfood.
 
 ## Next action
 
