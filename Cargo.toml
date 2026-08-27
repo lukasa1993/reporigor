@@ -1,0 +1,78 @@
+[workspace]
+resolver = "2"
+members = [
+  "crates/reporigor-core",
+  "crates/adapter-tree-sitter",
+  "crates/adapter-rust",
+  "crates/adapter-clang",
+  "crates/adapter-project",
+  "crates/analysis-crap",
+  "crates/analysis-dry",
+  "crates/analysis-mutate",
+  "crates/process-tree",
+  "crates/provider-mutation",
+  "crates/reporting",
+  "crates/reporigor",
+  "crates/corpus-harness",
+]
+exclude = ["corpus/checkouts/crap4rust"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.82"
+license = "MIT"
+authors = ["lukasa1993"]
+repository = "https://github.com/lukasa1993/reporigor"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+base64 = "0.22.1"
+cargo_metadata = "=0.20.0"
+clap = { version = "=4.5.50", features = ["derive", "env", "wrap_help"] }
+ctrlc = { version = "=3.4.7", features = ["termination"] }
+ignore = "=0.4.23"
+globset = "=0.4.16"
+indexmap = "=2.13.0"
+libc = "0.2.175"
+proc-macro2 = { version = "1.0.101", features = ["span-locations"] }
+quote = "1.0.40"
+regex = "1.11.2"
+rustix = { version = "=1.1.4", features = ["fs"] }
+same-file = "=1.0.6"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.145"
+sha2 = "0.10.9"
+syn = { version = "3.0.0", features = ["full", "visit"] }
+tempfile = "=3.24.0"
+thiserror = "2.0.16"
+toml = "=0.8.23"
+tree-sitter = "=0.26.13"
+tree-sitter-bash = "=0.25.1"
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-objc = "=3.0.2"
+tree-sitter-python = "=0.25.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-swift = "=0.7.3"
+tree-sitter-typescript = "=0.23.2"
+wait-timeout = "0.2.1"
+walkdir = "2.5.0"
+windows-sys = "0.59.0"
+xml-rs = "=0.8.29"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "deny", priority = -1 }
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

@@ -1,0 +1,30 @@
+[package]
+name = "adapter-tree-sitter"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Pinned multi-language Tree-sitter analysis adapter for reporigor"
+# Mutation-safety tests can create ignored runtime coordination state below a
+# fixture. Never let that transient state enter a source package, including
+# before this new repository has its first committed Git index.
+exclude = ["tests/fixtures/target/**"]
+
+[dependencies]
+reporigor-core = { path = "../reporigor-core", version = "0.1.0" }
+# Tree-sitter's build-time serde_json enables preserve_order. Pinning this
+# transitive edge keeps the workspace's Rust 1.82 floor buildable.
+indexmap = "=2.13.0"
+tree-sitter = "=0.26.13"
+tree-sitter-bash = "=0.25.1"
+tree-sitter-c = "=0.24.2"
+tree-sitter-cpp = "=0.23.4"
+tree-sitter-objc = "=3.0.2"
+tree-sitter-python = "=0.25.0"
+tree-sitter-rust = "=0.24.2"
+tree-sitter-swift = "=0.7.3"
+tree-sitter-typescript = "=0.23.2"
+
+[lints]
+workspace = true

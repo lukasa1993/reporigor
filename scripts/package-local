@@ -1,0 +1,94 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+cargo_bin=${CARGO:-cargo}
+rustc_bin=${RUSTC:-rustc}
+
+if ! command -v "$cargo_bin" >/dev/null 2>&1; then
+  echo "package-local: cargo was not found; set CARGO to its executable" >&2
+  exit 1
+fi
+if ! command -v "$rustc_bin" >/dev/null 2>&1; then
+  echo "package-local: rustc was not found; set RUSTC to its executable" >&2
+  exit 1
+fi
+
+"$cargo_bin" build --release --locked --manifest-path "$workspace/Cargo.toml" \
+  --package reporigor --bin reporigor
+
+binary="$workspace/target/release/reporigor"
+if [ ! -x "$binary" ]; then
+  echo "package-local: release binary was not created at $binary" >&2
+  exit 1
+fi
+
+host_target=$("$rustc_bin" -vV | sed -n 's/^host: //p')
+if [ -z "$host_target" ]; then
+  echo "package-local: rustc did not report a host target" >&2
+  exit 1
+fi
+
+set -- $("$binary" --version)
+version=${2:-}
+if [ -z "$version" ]; then
+  echo "package-local: could not read the RepoRigor version" >&2
+  exit 1
+fi
+
+dist_dir=${REPORIGOR_DIST_DIR:-"$workspace/target/dist"}
+mkdir -p "$dist_dir" "$workspace/target"
+package_tmp=$(mktemp -d "$workspace/target/reporigor-package.XXXXXX")
+cleanup() {
+  if [ -n "${package_tmp:-}" ] && [ -d "$package_tmp" ]; then
+    rm -rf -- "$package_tmp"
+  fi
+}
+trap cleanup EXIT HUP INT TERM
+
+name="reporigor-$host_target"
+stage="$package_tmp/$name"
+mkdir -p "$stage"
+cp "$binary" "$stage/reporigor"
+
+for alias in \
+  crap4bash crap4c crap4cpp crap4objc crap4python crap4rust crap4swift crap4ts \
+  dry4bash dry4c dry4cpp dry4objc dry4python dry4rust dry4swift dry4ts \
+  mutate4bash mutate4c mutate4cpp mutate4objc mutate4python mutate4rust mutate4swift mutate4ts
+do
+  ln -s reporigor "$stage/$alias"
+done
+
+cp "$workspace/README.md" "$workspace/AGENT_PROMPT.md" "$workspace/LICENSE" \
+  "$workspace/THIRD_PARTY_NOTICES.md" "$stage/"
+cp "$workspace/reporigor.example.toml" "$stage/"
+cp -R "$workspace/schemas" "$stage/schemas"
+
+archive="$package_tmp/$name.tar.gz"
+checksum="$package_tmp/$name.tar.gz.sha256"
+tar -C "$package_tmp" -czf "$archive" "$name"
+
+if command -v sha256sum >/dev/null 2>&1; then
+  digest=$(sha256sum "$archive" | awk '{print $1}')
+else
+  digest=$(shasum -a 256 "$archive" | awk '{print $1}')
+fi
+printf '%s  %s\n' "$digest" "$name.tar.gz" > "$checksum"
+
+smoke="$package_tmp/smoke"
+mkdir -p "$smoke"
+tar -C "$smoke" -xzf "$archive"
+for executable in reporigor \
+  crap4bash crap4c crap4cpp crap4objc crap4python crap4rust crap4swift crap4ts \
+  dry4bash dry4c dry4cpp dry4objc dry4python dry4rust dry4swift dry4ts \
+  mutate4bash mutate4c mutate4cpp mutate4objc mutate4python mutate4rust mutate4swift mutate4ts
+do
+  "$smoke/$name/$executable" --version >/dev/null
+done
+
+mv -f -- "$archive" "$dist_dir/$name.tar.gz"
+mv -f -- "$checksum" "$dist_dir/$name.tar.gz.sha256"
+
+echo "package-local: built RepoRigor $version for $host_target"
+echo "package-local: $dist_dir/$name.tar.gz"
+echo "package-local: $dist_dir/$name.tar.gz.sha256"

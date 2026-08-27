@@ -1,0 +1,109 @@
+schema_version = 1
+
+[[corpus]]
+language = "bash"
+name = "bash-it"
+repository = "https://github.com/Bash-it/bash-it.git"
+revision = "9b57bfdd6bac5604e4d21eeb273520949a7345ab"
+license = "MIT"
+tier = "scheduled"
+modes = ["generic", "native"]
+filters = ["lib/", "plugins/", "completion/"]
+timeout_seconds = 180
+max_output_bytes = 67108864
+
+[[corpus]]
+language = "c"
+name = "check"
+repository = "https://github.com/libcheck/check.git"
+revision = "35d9cc011faa0545bf56d5062ae90bbc2688eba7"
+license = "LGPL-2.1-or-later"
+tier = "scheduled"
+modes = ["generic"]
+filters = ["src/", "lib/"]
+timeout_seconds = 180
+max_output_bytes = 67108864
+
+[[corpus]]
+language = "cpp"
+name = "fmt"
+repository = "https://github.com/fmtlib/fmt.git"
+revision = "e27cc20bd93a4e280fb9268d41cd131069a9c73f"
+license = "MIT"
+tier = "scheduled"
+modes = ["generic"]
+filters = ["src/", "include/"]
+timeout_seconds = 180
+max_output_bytes = 67108864
+
+[[corpus]]
+language = "objective-c"
+name = "AFNetworking"
+repository = "https://github.com/AFNetworking/AFNetworking.git"
+revision = "d9f589cc2c1fe9d55eb5eea00558010afea7a41e"
+license = "MIT"
+tier = "scheduled"
+modes = ["generic"]
+filters = ["AFNetworking/"]
+timeout_seconds = 180
+max_output_bytes = 67108864
+
+[[corpus]]
+language = "python"
+name = "click"
+repository = "https://github.com/pallets/click.git"
+revision = "36baa15ff831b939a22bc527cd76ce653ef6f66d"
+license = "BSD-3-Clause"
+tier = "scheduled"
+modes = ["generic", "native"]
+filters = ["src/click/"]
+timeout_seconds = 180
+max_output_bytes = 67108864
+
+[[corpus]]
+language = "rust"
+name = "crap4rust"
+repository = "https://github.com/lukasa1993/crap4rust.git"
+revision = "e1eb0d29ea81304715f85a379be22855d292bb38"
+license = "MIT"
+tier = "pull-request"
+modes = ["generic", "native"]
+filters = ["src/"]
+timeout_seconds = 180
+max_output_bytes = 67108864
+
+[[corpus]]
+language = "swift"
+name = "swift-argument-parser"
+repository = "https://github.com/apple/swift-argument-parser.git"
+revision = "e24941a11359a745b38f5e69fae358d6f0ad88d3"
+license = "Apache-2.0 WITH Swift-exception"
+tier = "scheduled"
+modes = ["generic", "native"]
+filters = ["Sources/"]
+timeout_seconds = 240
+max_output_bytes = 67108864
+
+[[corpus]]
+language = "typescript"
+name = "p-queue"
+repository = "https://github.com/sindresorhus/p-queue.git"
+revision = "180ab9e25cd10b6f548767d7176076b50d25e188"
+license = "MIT"
+tier = "pull-request"
+modes = ["generic"]
+filters = ["source/"]
+timeout_seconds = 120
+max_output_bytes = 33554432
+
+[[corpus]]
+language = "typescript"
+name = "zod"
+repository = "https://github.com/colinhacks/zod.git"
+revision = "37b015017b17420e81e76555066bdfa39c24cdc5"
+license = "MIT"
+tier = "scheduled"
+modes = ["generic"]
+filters = ["packages/zod/src/"]
+timeout_seconds = 240
+max_output_bytes = 67108864

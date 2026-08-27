@@ -1,0 +1,22 @@
+[package]
+name = "analysis-crap"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Language-neutral CRAP metric and coverage analysis for reporigor"
+
+[dependencies]
+reporigor-core = { path = "../reporigor-core", version = "0.1.0" }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+xml-rs.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

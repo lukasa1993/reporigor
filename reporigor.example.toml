@@ -1,0 +1,24 @@
+backend = "auto"
+include_tests = false
+allow_parse_errors = false
+max_source_bytes = 8388608
+
+[crap]
+fail_over = 6.0
+allow_missing_coverage = false
+allow_empty = false
+
+[dry]
+min_tokens = 30
+max_groups = 50
+max_occurrences_per_window = 100
+max_total_windows = 1000000
+max_fingerprint_buckets = 500000
+max_candidate_work = 10000000
+fail = false
+
+[mutation]
+timeout_seconds = 120.0
+# test_command = "cargo test"
+# validation_command = "cargo check"
+# max_mutants = 100

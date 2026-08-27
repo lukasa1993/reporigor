@@ -1,0 +1,676 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:reporigor:schema:report:v1",
+  "title": "reporigor native report v1",
+  "description": "Lossless native JSON envelope emitted by reporigor when --format json is selected.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "tool",
+    "command",
+    "root",
+    "summary",
+    "backends",
+    "diagnostics",
+    "results"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "tool": {
+      "$ref": "#/$defs/toolInfo"
+    },
+    "command": {
+      "enum": ["crap", "dry", "mutate", "check"]
+    },
+    "root": {
+      "$ref": "#/$defs/path"
+    },
+    "summary": {
+      "$ref": "#/$defs/reportSummary"
+    },
+    "backends": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/backendInfo"
+      }
+    },
+    "diagnostics": {
+      "type": "array",
+      "items": {
+        "$ref": "#/$defs/diagnostic"
+      }
+    },
+    "results": {
+      "$ref": "#/$defs/reportData"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "command": {
+            "const": "crap"
+          }
+        },
+        "required": ["command"]
+      },
+      "then": {
+        "properties": {
+          "results": {
+            "type": "object",
+            "required": ["crap"],
+            "properties": {
+              "crap": {
+                "$ref": "#/$defs/crapReport"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "command": {
+            "const": "dry"
+          }
+        },
+        "required": ["command"]
+      },
+      "then": {
+        "properties": {
+          "results": {
+            "type": "object",
+            "required": ["dry"],
+            "properties": {
+              "dry": {
+                "$ref": "#/$defs/dryReport"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "command": {
+            "const": "mutate"
+          }
+        },
+        "required": ["command"]
+      },
+      "then": {
+        "properties": {
+          "results": {
+            "type": "object",
+            "required": ["mutate"],
+            "properties": {
+              "mutate": {
+                "$ref": "#/$defs/mutationReport"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": true,
+  "$defs": {
+    "nonNegativeInteger": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "positiveLine": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 4294967295
+    },
+    "path": {
+      "type": "string"
+    },
+    "language": {
+      "enum": [
+        "bash",
+        "c",
+        "cpp",
+        "objective-c",
+        "python",
+        "rust",
+        "swift",
+        "typescript"
+      ]
+    },
+    "toolInfo": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "reportSummary": {
+      "type": "object",
+      "required": [
+        "files",
+        "functions",
+        "crap_over_limit",
+        "duplicate_groups",
+        "mutants",
+        "killed",
+        "survived",
+        "no_coverage",
+        "mutation_errors",
+        "findings",
+        "parse_errors",
+        "diagnostics"
+      ],
+      "properties": {
+        "files": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "functions": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "crap_over_limit": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "duplicate_groups": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "mutants": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "killed": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "survived": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "no_coverage": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "mutation_errors": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "findings": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "parse_errors": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "diagnostics": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      },
+      "additionalProperties": true
+    },
+    "backendInfo": {
+      "type": "object",
+      "required": ["id", "version", "native", "capabilities"],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        },
+        "native": {
+          "type": "boolean"
+        },
+        "capabilities": {
+          "type": "object",
+          "required": ["capabilities"],
+          "properties": {
+            "capabilities": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {
+                "enum": [
+                  "syntax",
+                  "functions",
+                  "complexity",
+                  "tokens",
+                  "mutations",
+                  "project_semantics",
+                  "parse_validation"
+                ]
+              }
+            }
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "sourceLocation": {
+      "description": "A half-open source span with one-based lines and Unicode-scalar columns.",
+      "type": "object",
+      "required": ["file", "start_line", "start_column", "end_line", "end_column"],
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/path"
+        },
+        "start_line": {
+          "$ref": "#/$defs/positiveLine"
+        },
+        "start_column": {
+          "$ref": "#/$defs/positiveLine"
+        },
+        "end_line": {
+          "$ref": "#/$defs/positiveLine"
+        },
+        "end_column": {
+          "$ref": "#/$defs/positiveLine"
+        }
+      },
+      "additionalProperties": true
+    },
+    "diagnostic": {
+      "type": "object",
+      "required": ["severity", "backend", "message"],
+      "properties": {
+        "severity": {
+          "enum": ["info", "warning", "error"]
+        },
+        "backend": {
+          "type": "string"
+        },
+        "message": {
+          "type": "string"
+        },
+        "location": {
+          "$ref": "#/$defs/sourceLocation"
+        },
+        "fallback_used": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "functionRecord": {
+      "type": "object",
+      "required": ["language", "name", "file", "start_line", "end_line", "complexity"],
+      "properties": {
+        "language": {
+          "$ref": "#/$defs/language"
+        },
+        "name": {
+          "type": "string"
+        },
+        "file": {
+          "$ref": "#/$defs/path"
+        },
+        "start_line": {
+          "$ref": "#/$defs/positiveLine"
+        },
+        "end_line": {
+          "$ref": "#/$defs/positiveLine"
+        },
+        "complexity": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "coverage": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "crap": {
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "crapSummary": {
+      "type": "object",
+      "required": ["functions", "missing_coverage", "over_limit", "limit"],
+      "properties": {
+        "functions": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "missing_coverage": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "over_limit": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "limit": {
+          "type": "number"
+        }
+      },
+      "additionalProperties": true
+    },
+    "crapReport": {
+      "type": "object",
+      "required": ["summary", "functions"],
+      "properties": {
+        "summary": {
+          "$ref": "#/$defs/crapSummary"
+        },
+        "coverage": {
+          "$ref": "#/$defs/coverageApplication"
+        },
+        "functions": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/functionRecord"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "coverageApplication": {
+      "type": "object",
+      "required": [
+        "total_functions",
+        "matched_functions",
+        "unmatched_functions",
+        "empty_ranges"
+      ],
+      "properties": {
+        "total_functions": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "matched_functions": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "unmatched_functions": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "empty_ranges": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      },
+      "additionalProperties": true
+    },
+    "drySummary": {
+      "type": "object",
+      "required": ["groups", "min_tokens"],
+      "properties": {
+        "groups": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "min_tokens": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      },
+      "additionalProperties": true
+    },
+    "duplicateLocation": {
+      "type": "object",
+      "required": ["file", "start_line", "end_line"],
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/path"
+        },
+        "start_line": {
+          "$ref": "#/$defs/positiveLine"
+        },
+        "end_line": {
+          "$ref": "#/$defs/positiveLine"
+        }
+      },
+      "additionalProperties": true
+    },
+    "duplicate": {
+      "type": "object",
+      "required": ["token_count", "locations"],
+      "properties": {
+        "token_count": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "locations": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/duplicateLocation"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "dryReport": {
+      "type": "object",
+      "required": ["summary", "duplicates"],
+      "properties": {
+        "summary": {
+          "$ref": "#/$defs/drySummary"
+        },
+        "duplicates": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/duplicate"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "mutationSummary": {
+      "type": "object",
+      "required": [
+        "total",
+        "killed",
+        "survived",
+        "no_coverage",
+        "compile_error",
+        "runtime_error",
+        "timeout",
+        "invalid",
+        "ignored",
+        "pending"
+      ],
+      "properties": {
+        "total": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "killed": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "survived": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "no_coverage": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "compile_error": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "runtime_error": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "timeout": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "invalid": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "ignored": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "pending": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "mutation_score": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "additionalProperties": true
+    },
+    "mutationResult": {
+      "type": "object",
+      "required": [
+        "id",
+        "language",
+        "file",
+        "line",
+        "column",
+        "original",
+        "replacement",
+        "start_byte",
+        "end_byte",
+        "status",
+        "exit_code",
+        "duration_seconds"
+      ],
+      "properties": {
+        "id": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "language": {
+          "$ref": "#/$defs/language"
+        },
+        "file": {
+          "$ref": "#/$defs/path"
+        },
+        "line": {
+          "description": "One-based start line.",
+          "$ref": "#/$defs/positiveLine"
+        },
+        "column": {
+          "description": "One-based Unicode-scalar start column.",
+          "$ref": "#/$defs/positiveLine"
+        },
+        "original": {
+          "type": "string"
+        },
+        "replacement": {
+          "type": "string"
+        },
+        "start_byte": {
+          "description": "Inclusive zero-based UTF-8 byte offset.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "end_byte": {
+          "description": "Exclusive zero-based UTF-8 byte offset.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "status": {
+          "enum": [
+            "killed",
+            "survived",
+            "no-coverage",
+            "compile-error",
+            "runtime-error",
+            "timeout",
+            "invalid",
+            "ignored",
+            "pending"
+          ]
+        },
+        "exit_code": {
+          "type": ["integer", "null"]
+        },
+        "duration_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "detail": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "mutationReport": {
+      "type": "object",
+      "required": ["summary", "mutants"],
+      "properties": {
+        "summary": {
+          "$ref": "#/$defs/mutationSummary"
+        },
+        "run": {
+          "$ref": "#/$defs/mutationRunProvenance"
+        },
+        "mutants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/mutationResult"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "mutationRunProvenance": {
+      "type": "object",
+      "required": ["mode", "recovery", "baseline"],
+      "properties": {
+        "mode": {
+          "enum": ["list", "execute"]
+        },
+        "recovery": {
+          "enum": ["none", "already-clean", "restored"]
+        },
+        "baseline": {
+          "$ref": "#/$defs/baselineReport"
+        }
+      },
+      "additionalProperties": true
+    },
+    "baselineReport": {
+      "type": "object",
+      "properties": {
+        "validation": {
+          "$ref": "#/$defs/commandOutcome"
+        },
+        "test": {
+          "$ref": "#/$defs/commandOutcome"
+        }
+      },
+      "additionalProperties": true
+    },
+    "commandOutcome": {
+      "type": "object",
+      "required": [
+        "exit_code",
+        "timed_out",
+        "duration_seconds",
+        "output",
+        "output_truncated"
+      ],
+      "properties": {
+        "exit_code": {
+          "type": ["integer", "null"]
+        },
+        "timed_out": {
+          "type": "boolean"
+        },
+        "duration_seconds": {
+          "type": "number",
+          "minimum": 0
+        },
+        "output": {
+          "type": "string"
+        },
+        "output_truncated": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "reportData": {
+      "type": "object",
+      "properties": {
+        "crap": {
+          "$ref": "#/$defs/crapReport"
+        },
+        "dry": {
+          "$ref": "#/$defs/dryReport"
+        },
+        "mutate": {
+          "$ref": "#/$defs/mutationReport"
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

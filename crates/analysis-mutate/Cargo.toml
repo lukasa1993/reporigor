@@ -1,0 +1,32 @@
+[package]
+name = "analysis-mutate"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Safe, language-neutral mutation execution for reporigor"
+
+[dependencies]
+base64.workspace = true
+reporigor-core = { path = "../reporigor-core", version = "0.1.0" }
+reporigor-process-tree = { path = "../process-tree", version = "0.1.0" }
+fs2 = "0.4.3"
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+rustix.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+winapi-util = "0.1.11"
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

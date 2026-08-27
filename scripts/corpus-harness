@@ -1,0 +1,55 @@
+#!/bin/sh
+set -eu
+
+workspace=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+operation=${1:-help}
+
+if [ -n "${CARGO:-}" ]; then
+  harness_cargo_mode=direct
+  harness_cargo_bin=$CARGO
+elif command -v cargo >/dev/null 2>&1; then
+  harness_cargo_mode=direct
+  harness_cargo_bin=cargo
+elif command -v rustup >/dev/null 2>&1; then
+  harness_cargo_mode=rustup
+  harness_rustup_bin=$(command -v rustup)
+  harness_toolchain=$("$harness_rustup_bin" show active-toolchain | awk '{print $1}')
+else
+  echo "corpus-harness: cargo was not found; set CARGO to its executable path" >&2
+  exit 1
+fi
+
+run_cargo() {
+  if [ "$harness_cargo_mode" = rustup ]; then
+    "$harness_rustup_bin" run "$harness_toolchain" cargo "$@"
+  else
+    "$harness_cargo_bin" "$@"
+  fi
+}
+
+case "$operation" in
+  validate|verify|populate)
+    shift
+    run_cargo run --quiet --locked --manifest-path "$workspace/Cargo.toml" \
+      -p corpus-harness -- "$operation" "$@"
+    exit $?
+    ;;
+  run|update)
+    shift
+    run_cargo build --quiet --locked --manifest-path "$workspace/Cargo.toml" \
+      -p reporigor --bin reporigor -p corpus-harness
+    run_cargo run --quiet --locked --manifest-path "$workspace/Cargo.toml" \
+      -p corpus-harness -- "$operation" "$@"
+    exit $?
+    ;;
+  help|-h|--help)
+    run_cargo run --quiet --locked --manifest-path "$workspace/Cargo.toml" \
+      -p corpus-harness -- help
+    exit $?
+    ;;
+  *)
+    echo "corpus-harness: unknown operation: $operation" >&2
+    echo "usage: scripts/corpus-harness <validate|verify|populate|run|update> [options]" >&2
+    exit 2
+    ;;
+esac

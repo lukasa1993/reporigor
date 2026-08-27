@@ -1,0 +1,32 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+# Pinned so local plans and any future release workflow are reproducible.
+cargo-dist-version = "0.32.0"
+packages = ["reporigor"]
+targets = [
+  "x86_64-unknown-linux-gnu",
+  "aarch64-unknown-linux-gnu",
+  "x86_64-unknown-linux-musl",
+  "aarch64-unknown-linux-musl",
+  "x86_64-apple-darwin",
+  "aarch64-apple-darwin",
+  "x86_64-pc-windows-msvc",
+]
+installers = ["shell", "powershell", "homebrew", "npm"]
+install-path = "CARGO_HOME"
+install-success-msg = "RepoRigor is installed. Run `reporigor --help` to get started."
+checksum = "sha256"
+unix-archive = ".tar.gz"
+windows-archive = ".zip"
+include = ["AGENT_PROMPT.md", "reporigor.example.toml", "schemas", "THIRD_PARTY_NOTICES.md"]
+source-tarball = true
+fail-fast = false
+pr-run-mode = "plan"
+
+# The repository keeps a separately audited build-only workflow until a
+# maintainer explicitly approves publication. Dist can still plan and build
+# local artifacts from this configuration without creating external state.
+ci = []
+hosting = ["github"]

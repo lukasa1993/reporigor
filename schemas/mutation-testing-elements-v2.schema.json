@@ -1,0 +1,172 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:reporigor:schema:mutation-testing-elements:v2",
+  "title": "reporigor Mutation Testing Elements v2 export",
+  "description": "The Mutation Testing Elements 2.0-compatible JSON boundary emitted by reporigor when --format mutation-json is selected.",
+  "type": "object",
+  "required": ["schemaVersion", "thresholds", "projectRoot", "files", "framework"],
+  "properties": {
+    "schemaVersion": {
+      "const": "2.0"
+    },
+    "thresholds": {
+      "$ref": "#/$defs/thresholds"
+    },
+    "projectRoot": {
+      "type": "string"
+    },
+    "files": {
+      "type": "object",
+      "additionalProperties": {
+        "$ref": "#/$defs/fileResult"
+      }
+    },
+    "framework": {
+      "$ref": "#/$defs/framework"
+    }
+  },
+  "additionalProperties": true,
+  "$defs": {
+    "thresholds": {
+      "type": "object",
+      "required": ["high", "low"],
+      "properties": {
+        "high": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        },
+        "low": {
+          "type": "integer",
+          "minimum": 0,
+          "maximum": 100
+        }
+      },
+      "additionalProperties": true
+    },
+    "framework": {
+      "type": "object",
+      "required": ["name", "version"],
+      "properties": {
+        "name": {
+          "type": "string"
+        },
+        "version": {
+          "type": "string"
+        }
+      },
+      "additionalProperties": true
+    },
+    "fileResult": {
+      "type": "object",
+      "required": ["language", "source", "mutants"],
+      "properties": {
+        "language": {
+          "enum": [
+            "bash",
+            "c",
+            "cpp",
+            "objectivec",
+            "python",
+            "rust",
+            "swift",
+            "typescript"
+          ]
+        },
+        "source": {
+          "type": "string"
+        },
+        "mutants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/mutant"
+          }
+        }
+      },
+      "additionalProperties": true
+    },
+    "mutant": {
+      "type": "object",
+      "required": [
+        "id",
+        "mutatorName",
+        "description",
+        "replacement",
+        "location",
+        "status"
+      ],
+      "properties": {
+        "id": {
+          "type": "string"
+        },
+        "mutatorName": {
+          "description": "Provider-defined mutator identifier. Built-in values currently include EqualityOperator, RelationalOperator, LogicalOperator, BooleanLiteral, ArithmeticOperator, and GenericMutation.",
+          "type": "string",
+          "minLength": 1
+        },
+        "description": {
+          "type": "string"
+        },
+        "replacement": {
+          "type": "string"
+        },
+        "location": {
+          "$ref": "#/$defs/location"
+        },
+        "status": {
+          "enum": [
+            "Killed",
+            "Survived",
+            "NoCoverage",
+            "CompileError",
+            "RuntimeError",
+            "Timeout",
+            "Ignored",
+            "Pending"
+          ]
+        },
+        "statusReason": {
+          "type": "string"
+        },
+        "duration": {
+          "description": "Mutation execution duration in milliseconds.",
+          "type": "number",
+          "minimum": 0
+        }
+      },
+      "additionalProperties": true
+    },
+    "location": {
+      "description": "One-based source location; start is inclusive and end is exclusive.",
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "start": {
+          "$ref": "#/$defs/position"
+        },
+        "end": {
+          "$ref": "#/$defs/position"
+        }
+      },
+      "additionalProperties": true
+    },
+    "position": {
+      "description": "Line and Unicode-scalar column, both starting at one.",
+      "type": "object",
+      "required": ["line", "column"],
+      "properties": {
+        "line": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        },
+        "column": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 4294967295
+        }
+      },
+      "additionalProperties": true
+    }
+  }
+}

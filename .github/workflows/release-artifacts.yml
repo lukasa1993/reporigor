@@ -1,0 +1,196 @@
+name: Release artifacts (build only)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# This workflow intentionally cannot create a GitHub release or publish a crate.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-artifacts-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+
+jobs:
+  verify:
+    name: Release readiness
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install pinned Rust toolchain
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+
+      - name: Check tag matches package version
+        if: github.ref_type == 'tag'
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --locked --no-deps --format-version 1 | python3 -c '
+          import json
+          import sys
+
+          packages = json.load(sys.stdin)["packages"]
+          print(next(package["version"] for package in packages if package["name"] == "reporigor"))
+          ')"
+          expected="v${version}"
+          if [[ "${GITHUB_REF_NAME}" != "${expected}" ]]; then
+            printf 'tag %s does not match package version %s\n' "${GITHUB_REF_NAME}" "${expected}" >&2
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Check workspace
+        run: cargo check --workspace --all-targets --all-features --locked
+
+      - name: Lint workspace
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Run workspace tests
+        run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Dogfood RepoRigor against its own Rust and shell sources
+        run: scripts/dogfood
+
+      - name: Build documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --all-features --no-deps --locked
+
+      - name: Audit dependency policy
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2.1.1
+        with:
+          command: check advisories bans licenses sources
+          arguments: --all-features
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+          - os: windows-2025
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust target
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
+        with:
+          toolchain: 1.95.0
+          targets: ${{ matrix.target }}
+
+      - name: Install musl build tools
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools
+
+      - name: Build release binary
+        if: ${{ !contains(matrix.target, 'musl') }}
+        run: cargo build --release --locked --package reporigor --bin reporigor --target ${{ matrix.target }}
+
+      - name: Build static musl release binary
+        if: contains(matrix.target, 'musl')
+        shell: bash
+        env:
+          CC: musl-gcc
+        run: cargo build --release --locked --package reporigor --bin reporigor --target "${{ matrix.target }}"
+
+      - name: Package Unix artifact and checksum
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          name="reporigor-${TARGET}"
+          stage="dist/${name}"
+          mkdir -p "${stage}"
+          cp "target/${TARGET}/release/reporigor" "${stage}/"
+          for alias in \
+            crap4bash crap4c crap4cpp crap4objc crap4python crap4rust crap4swift crap4ts \
+            dry4bash dry4c dry4cpp dry4objc dry4python dry4rust dry4swift dry4ts \
+            mutate4bash mutate4c mutate4cpp mutate4objc mutate4python mutate4rust mutate4swift mutate4ts
+          do
+            ln -s reporigor "${stage}/${alias}"
+          done
+          cp README.md AGENT_PROMPT.md LICENSE THIRD_PARTY_NOTICES.md "${stage}/"
+          cp reporigor.example.toml "${stage}/"
+          cp -R schemas "${stage}/schemas"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          if command -v sha256sum >/dev/null 2>&1; then
+            digest="$(sha256sum "dist/${name}.tar.gz" | awk '{print $1}')"
+          else
+            digest="$(shasum -a 256 "dist/${name}.tar.gz" | awk '{print $1}')"
+          fi
+          printf '%s  %s\n' "${digest}" "${name}.tar.gz" > "dist/${name}.tar.gz.sha256"
+
+      - name: Package Windows artifact and checksum
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          $name = "reporigor-${env:TARGET}"
+          $stage = "dist/${name}"
+          New-Item -ItemType Directory -Path $stage -Force | Out-Null
+          Copy-Item "target/${env:TARGET}/release/reporigor.exe" $stage
+          $aliases = @(
+            "crap4bash", "crap4c", "crap4cpp", "crap4objc", "crap4python", "crap4rust", "crap4swift", "crap4ts",
+            "dry4bash", "dry4c", "dry4cpp", "dry4objc", "dry4python", "dry4rust", "dry4swift", "dry4ts",
+            "mutate4bash", "mutate4c", "mutate4cpp", "mutate4objc", "mutate4python", "mutate4rust", "mutate4swift", "mutate4ts"
+          )
+          foreach ($alias in $aliases) {
+            Copy-Item "target/${env:TARGET}/release/reporigor.exe" "${stage}/${alias}.exe"
+          }
+          Copy-Item README.md, AGENT_PROMPT.md, LICENSE, THIRD_PARTY_NOTICES.md $stage
+          Copy-Item reporigor.example.toml $stage
+          Copy-Item schemas $stage -Recurse
+          Compress-Archive -Path "${stage}/*" -DestinationPath "dist/${name}.zip"
+          $digest = (Get-FileHash "dist/${name}.zip" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "${digest}  ${name}.zip" | Set-Content -Path "dist/${name}.zip.sha256" -Encoding ascii
+
+      - name: Upload build-only artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: reporigor-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          retention-days: 14

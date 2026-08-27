@@ -1,0 +1,25 @@
+[package]
+name = "adapter-rust"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Cargo-aware Rust source analysis adapter for reporigor"
+
+[dependencies]
+reporigor-core = { path = "../reporigor-core", version = "0.1.0" }
+reporigor-process-tree = { path = "../process-tree", version = "0.1.0" }
+proc-macro2.workspace = true
+quote.workspace = true
+rustc_lexer = "0.1.0"
+serde.workspace = true
+serde_json.workspace = true
+syn.workspace = true
+walkdir.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "analysis-dry"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic normalized-token duplicate analysis for reporigor"
+
+[dependencies]
+reporigor-core = { path = "../reporigor-core", version = "0.1.0" }
+serde.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+
+[lints]
+workspace = true

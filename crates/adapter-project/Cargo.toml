@@ -1,0 +1,21 @@
+[package]
+name = "adapter-project"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Project and toolchain discovery adapters for reporigor"
+
+[dependencies]
+reporigor-core = { path = "../reporigor-core", version = "0.1.0" }
+reporigor-process-tree = { path = "../process-tree", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

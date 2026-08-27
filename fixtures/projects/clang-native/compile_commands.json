@@ -1,0 +1,17 @@
+[
+  {
+    "directory": ".",
+    "arguments": ["clang", "-std=c11", "-c", "src/sample.c", "-o", "sample.o"],
+    "file": "src/sample.c"
+  },
+  {
+    "directory": ".",
+    "arguments": ["clang++", "-std=c++17", "-c", "src/sample.cpp", "-o", "sample-cpp.o"],
+    "file": "src/sample.cpp"
+  },
+  {
+    "directory": ".",
+    "arguments": ["clang", "-x", "objective-c", "-c", "src/Sample.m", "-o", "sample-objc.o"],
+    "file": "src/Sample.m"
+  }
+]

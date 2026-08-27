@@ -1,0 +1,7 @@
+target/
+/.reporigor-cache/
+*.profraw
+*.profdata
+coverage.json
+coverage.lcov
+corpus/checkouts/

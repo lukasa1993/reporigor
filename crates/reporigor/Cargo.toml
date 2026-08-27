@@ -1,0 +1,152 @@
+[package]
+name = "reporigor"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage = "https://github.com/lukasa1993/reporigor"
+description = "Unified CRAP, duplication, and mutation analysis"
+default-run = "reporigor"
+readme = "../../README.md"
+keywords = ["code-quality", "complexity", "duplication", "mutation-testing", "static-analysis"]
+categories = ["command-line-utilities", "development-tools::testing"]
+# These two repository-level suites intentionally exercise shared fixtures that
+# live outside this crate. Keep running them in workspace CI, but do not ship
+# broken test targets in the standalone crates.io tarball.
+exclude = ["tests/e2e.rs", "tests/malformed_input.rs"]
+
+[[bin]]
+name = "reporigor"
+path = "src/main.rs"
+
+# Migration multicall names. Every target compiles the exact same argv0-aware
+# entry point; behavior lives in one compatibility translator in the library.
+[[bin]]
+name = "crap4bash"
+path = "src/bin/crap4bash.rs"
+
+[[bin]]
+name = "crap4c"
+path = "src/bin/crap4c.rs"
+
+[[bin]]
+name = "crap4cpp"
+path = "src/bin/crap4cpp.rs"
+
+[[bin]]
+name = "crap4objc"
+path = "src/bin/crap4objc.rs"
+
+[[bin]]
+name = "crap4python"
+path = "src/bin/crap4python.rs"
+
+[[bin]]
+name = "crap4rust"
+path = "src/bin/crap4rust.rs"
+
+[[bin]]
+name = "crap4swift"
+path = "src/bin/crap4swift.rs"
+
+[[bin]]
+name = "crap4ts"
+path = "src/bin/crap4ts.rs"
+
+[[bin]]
+name = "dry4bash"
+path = "src/bin/dry4bash.rs"
+
+[[bin]]
+name = "dry4c"
+path = "src/bin/dry4c.rs"
+
+[[bin]]
+name = "dry4cpp"
+path = "src/bin/dry4cpp.rs"
+
+[[bin]]
+name = "dry4objc"
+path = "src/bin/dry4objc.rs"
+
+[[bin]]
+name = "dry4python"
+path = "src/bin/dry4python.rs"
+
+[[bin]]
+name = "dry4rust"
+path = "src/bin/dry4rust.rs"
+
+[[bin]]
+name = "dry4swift"
+path = "src/bin/dry4swift.rs"
+
+[[bin]]
+name = "dry4ts"
+path = "src/bin/dry4ts.rs"
+
+[[bin]]
+name = "mutate4bash"
+path = "src/bin/mutate4bash.rs"
+
+[[bin]]
+name = "mutate4c"
+path = "src/bin/mutate4c.rs"
+
+[[bin]]
+name = "mutate4cpp"
+path = "src/bin/mutate4cpp.rs"
+
+[[bin]]
+name = "mutate4objc"
+path = "src/bin/mutate4objc.rs"
+
+[[bin]]
+name = "mutate4python"
+path = "src/bin/mutate4python.rs"
+
+[[bin]]
+name = "mutate4rust"
+path = "src/bin/mutate4rust.rs"
+
+[[bin]]
+name = "mutate4swift"
+path = "src/bin/mutate4swift.rs"
+
+[[bin]]
+name = "mutate4ts"
+path = "src/bin/mutate4ts.rs"
+
+[dependencies]
+adapter-clang = { path = "../adapter-clang", version = "0.1.0" }
+adapter-project = { path = "../adapter-project", version = "0.1.0" }
+adapter-rust = { path = "../adapter-rust", version = "0.1.0" }
+adapter-tree-sitter = { path = "../adapter-tree-sitter", version = "0.1.0" }
+analysis-crap = { path = "../analysis-crap", version = "0.1.0" }
+analysis-dry = { path = "../analysis-dry", version = "0.1.0" }
+analysis-mutate = { path = "../analysis-mutate", version = "0.1.0" }
+anyhow.workspace = true
+clap.workspace = true
+ctrlc.workspace = true
+reporigor-core = { path = "../reporigor-core", version = "0.1.0" }
+reporigor-reporting = { path = "../reporting", version = "0.1.0" }
+provider-mutation = { path = "../provider-mutation", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.tar.gz"
+pkg-fmt = "tgz"
+bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
+
+[package.metadata.binstall.overrides.'cfg(target_os = "windows")']
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }.zip"
+pkg-fmt = "zip"
+bin-dir = "{ bin }{ binary-ext }"
+
+[lints]
+workspace = true
