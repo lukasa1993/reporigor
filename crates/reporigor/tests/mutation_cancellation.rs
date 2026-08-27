@@ -512,12 +512,31 @@ fn send_signal(signal: &str, pid: u32) -> io::Result<()> {
 }
 
 fn process_exists(pid: u32) -> bool {
-    Command::new("/bin/kill")
+    let signallable = Command::new("/bin/kill")
         .args(["-0", &pid.to_string()])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .is_ok_and(|status| status.success())
+        .is_ok_and(|status| status.success());
+    if !signallable {
+        return false;
+    }
+
+    // A killed child can remain as a zombie under a container's minimal PID 1.
+    // `kill -0` still succeeds for that PID even though no code can run. Both
+    // BSD and procps `ps` expose `Z` as the first process-state character.
+    match Command::new("/bin/ps")
+        .args(["-o", "stat=", "-p", &pid.to_string()])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        Ok(output) if output.status.success() => !String::from_utf8_lossy(&output.stdout)
+            .trim_start()
+            .starts_with('Z'),
+        Ok(_) => false,
+        Err(_) => true,
+    }
 }
 
 fn wait_for_process_exit(pid: u32, timeout: Duration) -> io::Result<()> {

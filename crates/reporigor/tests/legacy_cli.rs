@@ -1,6 +1,7 @@
 use std::fs;
 use std::process::Command;
 
+use analysis_mutate::STATE_DIRECTORY_ENV;
 use tempfile::tempdir;
 
 #[test]
@@ -40,6 +41,7 @@ fn isolated_legacy_launcher_explains_its_sibling_requirement() -> Result<(), Box
 #[test]
 fn dry_alias_accepts_legacy_root_json_and_filter_syntax() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
+    let state_parent = tempdir()?;
     fs::write(
         directory.path().join("sample.py"),
         "def alpha(value):\n    return value + 1\n\ndef beta(value):\n    return value + 1\n",
@@ -48,6 +50,7 @@ fn dry_alias_accepts_legacy_root_json_and_filter_syntax() -> Result<(), Box<dyn 
         .args(["sample", "--root"])
         .arg(directory.path())
         .args(["--min-tokens", "4", "--json"])
+        .env(STATE_DIRECTORY_ENV, state_parent.path())
         .output()?;
     assert!(
         output.status.success(),
@@ -63,6 +66,7 @@ fn dry_alias_accepts_legacy_root_json_and_filter_syntax() -> Result<(), Box<dyn 
 #[test]
 fn mutate_alias_list_is_read_only() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
+    let state_parent = tempdir()?;
     let source_path = directory.path().join("sample.py");
     let source = "def compare(left, right):\n    return left == right\n";
     fs::write(&source_path, source)?;
@@ -70,6 +74,7 @@ fn mutate_alias_list_is_read_only() -> Result<(), Box<dyn std::error::Error>> {
         .args(["--root"])
         .arg(directory.path())
         .args(["--list", "--json"])
+        .env(STATE_DIRECTORY_ENV, state_parent.path())
         .output()?;
     assert!(
         output.status.success(),
@@ -85,6 +90,7 @@ fn mutate_alias_list_is_read_only() -> Result<(), Box<dyn std::error::Error>> {
 #[test]
 fn crap_alias_reads_existing_coverage_and_preserves_gate_exit() -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
+    let state_parent = tempdir()?;
     fs::write(
         directory.path().join("sample.py"),
         "def covered(value):\n    if value:\n        return 1\n    return 0\n",
@@ -114,6 +120,7 @@ fn crap_alias_reads_existing_coverage_and_preserves_gate_exit() -> Result<(), Bo
             "100",
             "--json",
         ])
+        .env(STATE_DIRECTORY_ENV, state_parent.path())
         .output()?;
     assert!(
         output.status.success(),
@@ -173,6 +180,7 @@ fn every_crap_binary_rejects_invalid_thresholds_at_parse_time() -> Result<(), Bo
 fn no_validate_suppresses_configured_validation_but_absence_preserves_fallback(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let directory = tempdir()?;
+    let state_parent = tempdir()?;
     fs::write(
         directory.path().join("sample.py"),
         "def compare(left, right):\n    return left == right\n",
@@ -196,6 +204,7 @@ fn no_validate_suppresses_configured_validation_but_absence_preserves_fallback(
             "--allow-survivors",
             "--json",
         ])
+        .env(STATE_DIRECTORY_ENV, state_parent.path())
         .output()?;
     assert!(
         suppressed.status.success(),
@@ -220,6 +229,7 @@ fn no_validate_suppresses_configured_validation_but_absence_preserves_fallback(
             "--allow-compile-errors",
             "--json",
         ])
+        .env(STATE_DIRECTORY_ENV, state_parent.path())
         .output()?;
     assert!(
         configured_fallback.status.success(),

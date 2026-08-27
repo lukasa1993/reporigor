@@ -1,6 +1,8 @@
+use std::collections::HashMap;
 use std::fs::{self, File, FileTimes, Metadata, OpenOptions, Permissions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::STANDARD as BASE64;
@@ -759,10 +761,73 @@ fn ensure_regular_nonsymlink(path: &Path, purpose: &'static str) -> Result<(), M
     }
 }
 
+#[derive(Debug, Default)]
+struct ProcessLockState {
+    readers: usize,
+    writer: bool,
+}
+
+fn process_lock_table() -> &'static Mutex<HashMap<PathBuf, ProcessLockState>> {
+    static TABLE: OnceLock<Mutex<HashMap<PathBuf, ProcessLockState>>> = OnceLock::new();
+    TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[derive(Debug)]
+struct ProcessLockGuard {
+    path: PathBuf,
+    exclusive: bool,
+}
+
+impl ProcessLockGuard {
+    fn try_acquire(path: &Path, exclusive: bool) -> Option<Self> {
+        let mut table = process_lock_table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let state = table.entry(path.to_path_buf()).or_default();
+        if exclusive {
+            if state.writer || state.readers != 0 {
+                return None;
+            }
+            state.writer = true;
+        } else {
+            if state.writer {
+                return None;
+            }
+            state.readers = state.readers.checked_add(1)?;
+        }
+        Some(Self {
+            path: path.to_path_buf(),
+            exclusive,
+        })
+    }
+}
+
+impl Drop for ProcessLockGuard {
+    fn drop(&mut self) {
+        let mut table = process_lock_table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let remove = if let Some(state) = table.get_mut(&self.path) {
+            if self.exclusive {
+                state.writer = false;
+            } else {
+                state.readers = state.readers.saturating_sub(1);
+            }
+            !state.writer && state.readers == 0
+        } else {
+            false
+        };
+        if remove {
+            table.remove(&self.path);
+        }
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct RunLockGuard {
     file: File,
     state: PathBuf,
+    _process_lock: ProcessLockGuard,
 }
 
 impl RunLockGuard {
@@ -822,13 +887,27 @@ impl RunLockGuard {
         }
         let deadline = wait_for_readers.then(|| Instant::now() + EXCLUSIVE_LOCK_WAIT);
         loop {
+            let process_lock = match ProcessLockGuard::try_acquire(&path, exclusive) {
+                Some(lock) => lock,
+                None if deadline.is_some_and(|deadline| Instant::now() < deadline) => {
+                    std::thread::sleep(LOCK_RETRY_INTERVAL);
+                    continue;
+                }
+                None => return Err(MutationError::AlreadyRunning { path }),
+            };
             let lock_result = if exclusive {
                 FileExt::try_lock_exclusive(&file)
             } else {
                 FileExt::try_lock_shared(&file)
             };
             match lock_result {
-                Ok(()) => return Ok(Self { file, state }),
+                Ok(()) => {
+                    return Ok(Self {
+                        file,
+                        state,
+                        _process_lock: process_lock,
+                    });
+                }
                 Err(error)
                     if error.kind() == ErrorKind::WouldBlock
                         && deadline.is_some_and(|deadline| Instant::now() < deadline) =>

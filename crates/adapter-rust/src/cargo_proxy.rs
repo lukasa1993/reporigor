@@ -163,7 +163,11 @@ fn canonical_executable(candidate: &Path) -> io::Result<PathBuf> {
     // the fully dereferenced `rustup` path would silently change semantics.
     // Keep that well-known shim name while still canonicalizing its parent,
     // validating its final target above, and returning an absolute path.
-    if canonical.file_name() == Some(OsStr::new(executable_name("rustup").as_str()))
+    let rustup = executable_name("rustup");
+    let rustup_init = executable_name("rustup-init");
+    if canonical
+        .file_name()
+        .is_some_and(|name| name == OsStr::new(&rustup) || name == OsStr::new(&rustup_init))
         && matches!(
             candidate.file_stem().and_then(OsStr::to_str),
             Some("cargo" | "rustc")
@@ -421,6 +425,29 @@ mod tests {
             .unwrap_or_else(|error| panic!("resolve rustc: {error}"));
         assert_eq!(resolved_rustc, rustc.canonicalize().unwrap_or(rustc));
         assert!(resolved_rustc.is_absolute());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rustup_init_symlink_preserves_the_requested_tool_name() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let absolute_bin = directory.path().join("bin");
+        fs::create_dir(&absolute_bin).unwrap_or_else(|error| panic!("absolute bin: {error}"));
+        let dispatcher = absolute_bin.join("rustup-init");
+        make_executable(&dispatcher);
+        let cargo = absolute_bin.join("cargo");
+        symlink(&dispatcher, &cargo).unwrap_or_else(|error| panic!("cargo symlink: {error}"));
+        let search =
+            env::join_paths([absolute_bin.clone()]).unwrap_or_else(|error| panic!("search path: {error}"));
+
+        let resolved = find_on_search_path(OsStr::new("cargo"), &search)
+            .unwrap_or_else(|error| panic!("resolve cargo: {error}"));
+        assert_eq!(
+            resolved,
+            absolute_bin.canonicalize().unwrap_or(absolute_bin).join("cargo")
+        );
     }
 
     #[test]

@@ -639,6 +639,14 @@ clearance or a permanent reservation; publication must repeat the checks.
 - Created the public GitHub repository `lukasa1993/reporigor` and pushed the
   initial `main` branch. No tag, release, crate, installer, or package was
   published.
+- Used the first clean GitHub Actions run as a portability audit and fixed four
+  issues it exposed: macOS rustup shims resolving through `rustup-init`, Linux
+  container zombies confusing cancellation assertions, Windows same-process
+  file-lock semantics, and legacy CLI tests sharing user-level state.
+- Added focused regressions, repeated the formerly racy legacy and cancellation
+  tests five times, and passed formatting, strict Clippy, the complete current
+  and Rust 1.82 suites, Windows-target compilation, and RepoRigor dogfood with
+  zero findings before the corrective push.
 
 ## Next action
 
