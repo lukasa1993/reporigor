@@ -1,5 +1,7 @@
 # RepoRigor
 
+[![CI](https://github.com/lukasa1993/reporigor/actions/workflows/ci.yml/badge.svg)](https://github.com/lukasa1993/reporigor/actions/workflows/ci.yml)
+
 One portable repository-quality CLI for Bash, C, C++, Objective-C, Python,
 Rust, Swift, and TypeScript.
 

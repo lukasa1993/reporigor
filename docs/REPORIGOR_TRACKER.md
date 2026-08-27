@@ -661,6 +661,10 @@ clearance or a permanent reservation; publication must repeat the checks.
   itself as leader and descendant, directly exercising inherited Job Object
   cleanup. The replacement compiles for the Windows target and passes local
   process-tree lint, tests, and RepoRigor dogfood.
+- GitHub Actions run
+  [`33111067417`](https://github.com/lukasa1993/reporigor/actions/runs/33111067417)
+  then passed dependency policy, format/lint/docs/dogfood, Rust 1.82, and the
+  complete Linux, macOS, and Windows test matrix.
 
 ## Next action
 
