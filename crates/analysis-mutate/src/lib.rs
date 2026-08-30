@@ -16,9 +16,13 @@ mod error;
 mod executor;
 mod filesystem;
 mod model;
+mod selection;
+mod signals;
+#[cfg(test)]
+mod test_support;
 
 pub use cancellation::CancellationToken;
-pub use command::run_command;
+pub use command::{run_command, MUTANT_FINGERPRINT_ENV, MUTANT_ID_ENV};
 pub use error::MutationError;
 pub use executor::{recover_active, MutationExecutionSession, MutationExecutor, MutationReadSession};
 pub use filesystem::{
@@ -26,6 +30,11 @@ pub use filesystem::{
     MAX_MUTATION_SOURCE_BYTES, RUN_LOCK, STATE_DIRECTORY, STATE_DIRECTORY_ENV,
 };
 pub use model::{
-    BaselinePhase, BaselineReport, CommandOutcome, CommandSpec, MutationMode, MutationOptions, MutationRun,
-    MutationSummary, RecoveryAction,
+    is_scoreable_status, mutation_score, BaselinePhase, BaselineReport, CommandOutcome, CommandSpec,
+    MutationMode, MutationOptions, MutationRun, MutationSummary, RecoveryAction,
+};
+pub use selection::{select_candidates, MutationSelectionError};
+pub use signals::{
+    cooperative_cancellation_scope, install_signal_handlers, process_cancellation_token,
+    CancellationSignalGuard, SignalHandlerError,
 };

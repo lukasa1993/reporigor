@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use crate::CancellationToken;
 
 /// How the built-in mutation engine should treat the supplied inventory.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum MutationMode {
     /// Return the inventory as pending without changing source files or running commands.
@@ -174,8 +174,11 @@ impl std::fmt::Display for BaselinePhase {
 pub struct CommandOutcome {
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    #[serde(default, skip_serializing)]
     pub duration_seconds: f64,
+    #[serde(default, skip_serializing)]
     pub output: String,
+    #[serde(default, skip_serializing)]
     pub output_truncated: bool,
 }
 
@@ -229,23 +232,165 @@ pub struct MutationSummary {
 impl MutationSummary {
     #[must_use]
     pub fn from_results(results: &[MutationResult]) -> Self {
-        let mut summary = Self {
-            total: results.len(),
-            ..Self::default()
-        };
+        let mut summary = Self::default();
         for result in results {
-            match result.status {
-                MutationStatus::Killed => summary.killed += 1,
-                MutationStatus::Survived => summary.survived += 1,
-                MutationStatus::NoCoverage => summary.no_coverage += 1,
-                MutationStatus::CompileError => summary.compile_error += 1,
-                MutationStatus::RuntimeError => summary.runtime_error += 1,
-                MutationStatus::Timeout => summary.timeout += 1,
-                MutationStatus::Invalid => summary.invalid += 1,
-                MutationStatus::Ignored => summary.ignored += 1,
-                MutationStatus::Pending => summary.pending += 1,
-            }
+            summary.record(result.status);
         }
+        summary.total = results.len();
         summary
+    }
+
+    fn record(&mut self, status: MutationStatus) {
+        if self.record_outcome(status) || self.record_execution_error(status) {
+            return;
+        }
+        self.record_selection(status);
+    }
+
+    fn record_outcome(&mut self, status: MutationStatus) -> bool {
+        match status {
+            MutationStatus::Killed => self.killed += 1,
+            MutationStatus::Survived => self.survived += 1,
+            MutationStatus::NoCoverage => self.no_coverage += 1,
+            _ => return false,
+        }
+        true
+    }
+
+    fn record_execution_error(&mut self, status: MutationStatus) -> bool {
+        let counter = if status == MutationStatus::CompileError {
+            &mut self.compile_error
+        } else if status == MutationStatus::RuntimeError {
+            &mut self.runtime_error
+        } else if status == MutationStatus::Timeout {
+            &mut self.timeout
+        } else {
+            return false;
+        };
+        *counter += 1;
+        true
+    }
+
+    fn record_selection(&mut self, status: MutationStatus) {
+        let counter = match status {
+            MutationStatus::Invalid => &mut self.invalid,
+            MutationStatus::Ignored => &mut self.ignored,
+            MutationStatus::Pending => &mut self.pending,
+            _ => {
+                debug_assert!(false, "status was handled by an earlier category");
+                return;
+            }
+        };
+        *counter += 1;
+    }
+
+    /// Return the mutation-score denominator. Only killed and surviving
+    /// mutants are scoreable; no other status is inferred to be equivalent.
+    #[must_use]
+    pub const fn scoreable_mutants(self) -> usize {
+        self.killed.saturating_add(self.survived)
+    }
+
+    /// Return `RepoRigor`'s mutation score as a unit-interval fraction.
+    ///
+    /// The denominator is exactly killed plus survived. Every operational,
+    /// invalid, ignored, pending, and uncovered status is non-scoreable.
+    #[must_use]
+    pub fn mutation_score(self) -> Option<f64> {
+        score_ratio(self.killed, self.scoreable_mutants())
+    }
+}
+
+/// Calculate the shared mutation score for one native result inventory.
+#[must_use]
+pub fn mutation_score(results: &[MutationResult]) -> Option<f64> {
+    let killed = results
+        .iter()
+        .filter(|result| result.status == MutationStatus::Killed)
+        .count();
+    let scoreable = results
+        .iter()
+        .filter(|result| is_scoreable_status(result.status))
+        .count();
+    score_ratio(killed, scoreable)
+}
+
+/// Whether a mutation outcome participates in the mutation-score denominator.
+#[must_use]
+pub const fn is_scoreable_status(status: MutationStatus) -> bool {
+    matches!(status, MutationStatus::Killed | MutationStatus::Survived)
+}
+
+fn score_ratio(killed: usize, scoreable: usize) -> Option<f64> {
+    if scoreable == 0 {
+        return None;
+    }
+    let killed = u32::try_from(killed).unwrap_or(u32::MAX);
+    let scoreable = u32::try_from(scoreable).unwrap_or(u32::MAX);
+    Some(f64::from(killed) / f64::from(scoreable))
+}
+
+#[cfg(test)]
+mod tests {
+    use reporigor_core::{MutationResult, MutationStatus};
+
+    use super::{is_scoreable_status, mutation_score, CommandSpec, MutationSummary};
+    use crate::test_support::{candidate, COMPARISON_TEXT};
+
+    #[test]
+    fn mutation_summary_and_score_policy_is_exact() {
+        let result = |status| MutationResult {
+            mutation: candidate(1, "src/lib.rs", "comparison", "fixture", COMPARISON_TEXT),
+            status,
+            exit_code: None,
+            duration_seconds: 0.0,
+            detail: None,
+        };
+        assert!(is_scoreable_status(MutationStatus::Killed));
+        assert!(is_scoreable_status(MutationStatus::Survived));
+        for status in MutationStatus::ALL.into_iter().skip(2) {
+            assert!(!is_scoreable_status(status));
+        }
+
+        let summary = MutationSummary {
+            killed: 3,
+            survived: 2,
+            no_coverage: 7,
+            timeout: 11,
+            ..MutationSummary::default()
+        };
+        assert_eq!(summary.scoreable_mutants(), 5);
+        assert_eq!(summary.mutation_score(), Some(0.6));
+        assert_eq!(MutationSummary::default().mutation_score(), None);
+
+        assert_eq!(CommandSpec::shell("cargo test").display(), "cargo test");
+        assert_eq!(
+            CommandSpec::program("cargo", ["test", "--workspace"]).display(),
+            "cargo test --workspace"
+        );
+
+        let results = [
+            result(MutationStatus::Killed),
+            result(MutationStatus::Survived),
+            result(MutationStatus::NoCoverage),
+            result(MutationStatus::CompileError),
+            result(MutationStatus::RuntimeError),
+            result(MutationStatus::Timeout),
+            result(MutationStatus::Invalid),
+            result(MutationStatus::Ignored),
+            result(MutationStatus::Pending),
+        ];
+        let summary = MutationSummary::from_results(&results);
+        assert_eq!(
+            (
+                summary.total,
+                (summary.killed, summary.survived, summary.no_coverage),
+                (summary.compile_error, summary.runtime_error, summary.timeout),
+                (summary.invalid, summary.ignored, summary.pending),
+            ),
+            (9, (1, 1, 1), (1, 1, 1), (1, 1, 1))
+        );
+        assert_eq!(summary.mutation_score(), Some(0.5));
+        assert_eq!(mutation_score(&results), summary.mutation_score());
     }
 }

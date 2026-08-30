@@ -9,6 +9,7 @@ members = [
   "crates/analysis-crap",
   "crates/analysis-dry",
   "crates/analysis-mutate",
+  "crates/analysis-quality",
   "crates/process-tree",
   "crates/provider-mutation",
   "crates/reporting",

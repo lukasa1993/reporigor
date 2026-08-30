@@ -4,16 +4,20 @@ use std::path::{Path, PathBuf};
 
 use analysis_crap::CoverageApplication;
 use analysis_dry::{Duplicate, Location as DuplicateLocation};
-use analysis_mutate::{BaselineReport, MutationMode, MutationRun, RecoveryAction};
+use analysis_mutate::{
+    mutation_score, BaselineReport as MutationBaselineReport, MutationMode, MutationRun, RecoveryAction,
+};
+use analysis_quality::{BaselineComparison, OmittedCheck, QualityAnalysis, SurvivingMutant};
 use reporigor_core::{
-    AnalysisSnapshot, BackendInfo, Diagnostic, FunctionRecord, MutationCandidate, MutationResult,
-    MutationStatus, Severity,
+    canonicalize_rule_results, normalize_repository_path, AnalysisSnapshot, BackendInfo, Diagnostic,
+    FunctionRecord, MutationCandidate, MutationResult, MutationStatus, RuleOutcome, RuleResult, RuleSummary,
+    Severity,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::{pretty_json, MutationThresholds, ReportError, REPORT_SCHEMA_VERSION};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ReportCommand {
     Crap,
@@ -132,7 +136,7 @@ impl CrapReport {
     #[must_use]
     pub fn from_analysis(analysis: analysis_crap::CrapAnalysis, limit: f64) -> Self {
         let analysis_crap::CrapAnalysis { functions, coverage } = analysis;
-        let mut report = Self::new(functions, limit);
+        let mut report = CrapReport::new(functions, limit);
         report.coverage = coverage;
         report
     }
@@ -144,7 +148,7 @@ pub struct DrySummary {
     pub min_tokens: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DryReport {
     pub summary: DrySummary,
     pub duplicates: Vec<Duplicate>,
@@ -170,10 +174,17 @@ impl DryReport {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct MutationSummary {
     pub total: usize,
+    #[serde(default)]
     pub killed: usize,
     pub survived: usize,
+    /// Mutants eligible for scoring: exactly killed plus survived.
+    #[serde(default)]
+    pub scoreable_mutants: usize,
+    #[serde(default)]
     pub no_coverage: usize,
+    #[serde(default)]
     pub compile_error: usize,
+    #[serde(default)]
     pub runtime_error: usize,
     pub timeout: usize,
     pub invalid: usize,
@@ -187,7 +198,7 @@ pub struct MutationSummary {
 pub struct MutationRunProvenance {
     pub mode: MutationMode,
     pub recovery: RecoveryAction,
-    pub baseline: BaselineReport,
+    pub baseline: MutationBaselineReport,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -202,31 +213,27 @@ impl MutationReport {
     #[must_use]
     pub fn new(mut mutants: Vec<MutationResult>) -> Self {
         mutants.sort_by(compare_mutations);
-        let mut summary = MutationSummary {
-            total: mutants.len(),
-            ..MutationSummary::default()
-        };
+        let mut counts = [0_usize; 9];
         for mutant in &mutants {
-            match mutant.status {
-                MutationStatus::Killed => summary.killed += 1,
-                MutationStatus::Survived => summary.survived += 1,
-                MutationStatus::NoCoverage => summary.no_coverage += 1,
-                MutationStatus::CompileError => summary.compile_error += 1,
-                MutationStatus::RuntimeError => summary.runtime_error += 1,
-                MutationStatus::Timeout => summary.timeout += 1,
-                MutationStatus::Invalid => summary.invalid += 1,
-                MutationStatus::Ignored => summary.ignored += 1,
-                MutationStatus::Pending => summary.pending += 1,
-            }
+            counts[usize::from(mutation_status_rank(mutant.status))] += 1;
         }
-        // Mutation Testing Elements treats killed and timed-out mutants as
-        // detected, and survived/no-coverage mutants as undetected. Compile
-        // and runtime errors are invalid and therefore excluded from score.
-        let detected = summary.killed + summary.timeout;
-        let valid = detected + summary.survived + summary.no_coverage;
-        if valid > 0 {
-            summary.mutation_score = Some((count_as_f64(detected) / count_as_f64(valid)) * 100.0);
-        }
+        // RepoRigor's scoreable statuses are exactly killed and survived.
+        // No-coverage and every operational/invalid status are excluded.
+        let scoreable_mutants = counts[0].saturating_add(counts[1]);
+        let summary = MutationSummary {
+            total: mutants.len(),
+            killed: counts[0],
+            survived: counts[1],
+            scoreable_mutants,
+            no_coverage: counts[2],
+            compile_error: counts[3],
+            runtime_error: counts[4],
+            timeout: counts[5],
+            invalid: counts[6],
+            ignored: counts[7],
+            pending: counts[8],
+            mutation_score: mutation_score(&mutants).map(|score| score * 100.0),
+        };
         Self {
             summary,
             run: None,
@@ -271,6 +278,125 @@ impl MutationReport {
     }
 }
 
+/// Baseline provenance for deterministic rule results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuleBaselineMetadata {
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    pub resolved: usize,
+    pub gate_passed: bool,
+}
+
+/// Unified deterministic rule results carried by the native `RepoRigor` report.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RuleReport {
+    /// Hash of deterministic check selection/configuration semantics.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub analysis_scope: Option<String>,
+    pub formulas: BTreeMap<String, String>,
+    pub summary: RuleSummary,
+    pub results: Vec<RuleResult>,
+    pub surviving_mutants: Vec<SurvivingMutant>,
+    pub omitted: Vec<OmittedCheck>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline: Option<RuleBaselineMetadata>,
+}
+
+impl RuleReport {
+    /// Canonicalize an analyzer result without baseline comparison metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReportError::InvalidRules`] for invalid paths, duplicate or
+    /// malformed violation IDs, or non-canonical rule identities.
+    pub fn new(analysis: QualityAnalysis) -> Result<Self, ReportError> {
+        Self::build(analysis, None, None)
+    }
+
+    /// Canonicalize an analyzer result and attach native-report baseline data.
+    ///
+    /// `path` identifies another native `RepoRigor` JSON report; it is not a
+    /// separate baseline format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ReportError::InvalidRules`] when the result inventory or
+    /// baseline path is not canonical and repository-relative.
+    pub fn with_baseline(
+        analysis: QualityAnalysis,
+        enabled: bool,
+        path: Option<String>,
+        analysis_scope: String,
+        comparison: &BaselineComparison,
+    ) -> Result<Self, ReportError> {
+        if !reporigor_core::is_lowercase_sha256(&analysis_scope) {
+            return Err(ReportError::InvalidRules(
+                "analysis scope must be a lowercase SHA-256 identifier".to_string(),
+            ));
+        }
+        let path = path
+            .map(|path| normalize_repository_path(&path).map_err(ReportError::InvalidRules))
+            .transpose()?;
+        Self::build(
+            analysis,
+            Some(analysis_scope),
+            Some(RuleBaselineMetadata {
+                enabled,
+                path,
+                resolved: comparison.resolved,
+                gate_passed: comparison.gate_passed,
+            }),
+        )
+    }
+
+    fn build(
+        analysis: QualityAnalysis,
+        analysis_scope: Option<String>,
+        baseline: Option<RuleBaselineMetadata>,
+    ) -> Result<Self, ReportError> {
+        let QualityAnalysis {
+            formulas,
+            mut results,
+            mut surviving_mutants,
+            mut omitted,
+        } = analysis;
+        let mut summary = canonicalize_rule_results(&mut results).map_err(ReportError::InvalidRules)?;
+        normalize_rule_collections(&mut surviving_mutants, &mut omitted);
+        if let Some(metadata) = &baseline {
+            summary.baseline_resolved = metadata.resolved;
+        }
+        Ok(Self {
+            analysis_scope,
+            formulas,
+            summary,
+            results,
+            surviving_mutants,
+            omitted,
+            baseline,
+        })
+    }
+
+    fn normalize(&mut self) {
+        self.results.sort_by(compare_rule_results);
+        normalize_rule_collections(&mut self.surviving_mutants, &mut self.omitted);
+        self.summary = RuleSummary::from_results(&self.results);
+        if let Some(metadata) = &self.baseline {
+            self.summary.baseline_resolved = metadata.resolved;
+        }
+    }
+}
+
+fn normalize_rule_collections(surviving_mutants: &mut Vec<SurvivingMutant>, omitted: &mut Vec<OmittedCheck>) {
+    surviving_mutants.sort_by(compare_surviving_mutants);
+    surviving_mutants.dedup();
+    omitted.sort_by(|left, right| (&left.rule_id, &left.reason).cmp(&(&right.rule_id, &right.reason)));
+    omitted.dedup();
+}
+
+/// Compatibility name for callers that describe the section as quality data.
+pub type QualityReport = RuleReport;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ReportData {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -279,6 +405,8 @@ pub struct ReportData {
     pub dry: Option<DryReport>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mutate: Option<MutationReport>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rules: Option<RuleReport>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -292,6 +420,24 @@ pub struct ReportSummary {
     pub survived: usize,
     pub no_coverage: usize,
     pub mutation_errors: usize,
+    #[serde(default)]
+    pub rule_results: usize,
+    #[serde(default)]
+    pub rule_failures: usize,
+    #[serde(default)]
+    pub omitted_checks: usize,
+    #[serde(default)]
+    pub surviving_mutants: usize,
+    #[serde(default)]
+    pub baseline_existing: usize,
+    #[serde(default)]
+    pub baseline_new: usize,
+    #[serde(default)]
+    pub baseline_worsened: usize,
+    #[serde(default)]
+    pub baseline_improved: usize,
+    #[serde(default)]
+    pub baseline_resolved: usize,
     pub findings: usize,
     pub parse_errors: usize,
     pub diagnostics: usize,
@@ -312,7 +458,7 @@ pub struct ReportEnvelope {
 impl ReportEnvelope {
     #[must_use]
     pub fn crap(context: ReportContext, report: CrapReport) -> Self {
-        Self::from_parts(
+        ReportEnvelope::from_parts(
             ReportCommand::Crap,
             context,
             ReportData {
@@ -324,7 +470,7 @@ impl ReportEnvelope {
 
     #[must_use]
     pub fn dry(context: ReportContext, report: DryReport) -> Self {
-        Self::from_parts(
+        ReportEnvelope::from_parts(
             ReportCommand::Dry,
             context,
             ReportData {
@@ -336,7 +482,7 @@ impl ReportEnvelope {
 
     #[must_use]
     pub fn mutate(context: ReportContext, report: MutationReport) -> Self {
-        Self::from_parts(
+        ReportEnvelope::from_parts(
             ReportCommand::Mutate,
             context,
             ReportData {
@@ -352,13 +498,26 @@ impl ReportEnvelope {
         crap: Option<CrapReport>,
         dry: Option<DryReport>,
         mutate: Option<MutationReport>,
+        rules: Option<RuleReport>,
     ) -> Self {
-        Self::from_parts(ReportCommand::Check, context, ReportData { crap, dry, mutate })
+        ReportEnvelope::from_parts(
+            ReportCommand::Check,
+            context,
+            ReportData {
+                crap,
+                dry,
+                mutate,
+                rules,
+            },
+        )
     }
 
     #[must_use]
-    fn from_parts(command: ReportCommand, mut context: ReportContext, results: ReportData) -> Self {
+    fn from_parts(command: ReportCommand, mut context: ReportContext, mut results: ReportData) -> Self {
         context.normalize();
+        if let Some(rules) = &mut results.rules {
+            rules.normalize();
+        }
         let summary = summarize(&context, &results);
         Self {
             schema_version: REPORT_SCHEMA_VERSION,
@@ -386,14 +545,14 @@ impl ReportEnvelope {
         crate::render_human(self)
     }
 
-    /// Project CRAP and DRY findings into SARIF 2.1.0.
+    /// Project CRAP, DRY, and file-backed rule findings into SARIF 2.1.0.
     ///
     /// # Errors
     ///
-    /// Returns an error when neither supported section is present or when the
+    /// Returns an error when no supported section is present or when the
     /// projection cannot be serialized.
     pub fn to_sarif_json(&self) -> Result<String, ReportError> {
-        crate::sarif_json(self)
+        pretty_json(&crate::sarif_value(self)?)
     }
 
     /// Project mutation results into Mutation Testing Elements v2 JSON.
@@ -440,9 +599,38 @@ fn summarize(context: &ReportContext, data: &ReportData) -> ReportSummary {
             + mutation.summary.timeout
             + mutation.summary.invalid;
     }
-    summary.findings =
+    let legacy_findings =
         summary.crap_over_limit + summary.duplicate_groups + summary.survived + summary.no_coverage;
+    let mut additional_rule_findings = 0_usize;
+    if let Some(rules) = &data.rules {
+        summary.rule_results = rules.summary.total;
+        summary.rule_failures = rules.summary.failed;
+        summary.omitted_checks = rules.omitted.len();
+        summary.surviving_mutants = rules.surviving_mutants.len();
+        summary.baseline_existing = rules.summary.baseline_existing;
+        summary.baseline_new = rules.summary.baseline_new;
+        summary.baseline_worsened = rules.summary.baseline_worsened;
+        summary.baseline_improved = rules.summary.baseline_improved;
+        summary.baseline_resolved = rules.summary.baseline_resolved;
+        additional_rule_findings = rules
+            .results
+            .iter()
+            .filter(|result| result.result == RuleOutcome::Fail)
+            .filter(|result| !duplicates_legacy_finding(result, data))
+            .count();
+    }
+    summary.findings = legacy_findings.saturating_add(additional_rule_findings);
     summary
+}
+
+fn duplicates_legacy_finding(result: &RuleResult, data: &ReportData) -> bool {
+    [
+        (data.crap.is_some(), "crap."),
+        (data.dry.is_some(), "dry."),
+        (data.mutate.is_some(), "mutation."),
+    ]
+    .into_iter()
+    .any(|(section_present, prefix)| section_present && result.rule_id.starts_with(prefix))
 }
 
 fn compare_duplicates(left: &Duplicate, right: &Duplicate) -> Ordering {
@@ -459,12 +647,20 @@ fn compare_duplicates(left: &Duplicate, right: &Duplicate) -> Ordering {
                 .find(|ordering| *ordering != Ordering::Equal)
                 .unwrap_or(Ordering::Equal)
         })
-        .then_with(|| left.locations.len().cmp(&right.locations.len()))
+        .then_with(|| compare_duplicate_group_identity(left, right))
+}
+
+fn compare_duplicate_group_identity(left: &Duplicate, right: &Duplicate) -> Ordering {
+    left.locations
+        .len()
+        .cmp(&right.locations.len())
+        .then_with(|| left.clone_group_id.cmp(&right.clone_group_id))
 }
 
 fn compare_duplicate_locations(left: &DuplicateLocation, right: &DuplicateLocation) -> Ordering {
     (
         &left.file,
+        &left.stable_symbol,
         left.start_line,
         left.end_line,
         left.start_token,
@@ -472,6 +668,7 @@ fn compare_duplicate_locations(left: &DuplicateLocation, right: &DuplicateLocati
     )
         .cmp(&(
             &right.file,
+            &right.stable_symbol,
             right.start_line,
             right.end_line,
             right.start_token,
@@ -482,6 +679,9 @@ fn compare_duplicate_locations(left: &DuplicateLocation, right: &DuplicateLocati
 fn compare_mutations(left: &MutationResult, right: &MutationResult) -> Ordering {
     (
         &left.mutation.file,
+        &left.mutation.stable_symbol,
+        &left.mutation.operator,
+        &left.mutation.fingerprint,
         left.mutation.line,
         left.mutation.column,
         left.mutation.id,
@@ -493,6 +693,9 @@ fn compare_mutations(left: &MutationResult, right: &MutationResult) -> Ordering 
     )
         .cmp(&(
             &right.mutation.file,
+            &right.mutation.stable_symbol,
+            &right.mutation.operator,
+            &right.mutation.fingerprint,
             right.mutation.line,
             right.mutation.column,
             right.mutation.id,
@@ -503,6 +706,24 @@ fn compare_mutations(left: &MutationResult, right: &MutationResult) -> Ordering 
             &right.detail,
         ))
         .then_with(|| left.duration_seconds.total_cmp(&right.duration_seconds))
+}
+
+fn compare_rule_results(left: &RuleResult, right: &RuleResult) -> Ordering {
+    (&left.rule_id, &left.file, &left.stable_symbol, &left.violation_id).cmp(&(
+        &right.rule_id,
+        &right.file,
+        &right.stable_symbol,
+        &right.violation_id,
+    ))
+}
+
+fn compare_surviving_mutants(left: &SurvivingMutant, right: &SurvivingMutant) -> Ordering {
+    (&left.fingerprint, &left.file, &left.stable_symbol, &left.operator).cmp(&(
+        &right.fingerprint,
+        &right.file,
+        &right.stable_symbol,
+        &right.operator,
+    ))
 }
 
 fn compare_diagnostics(left: &Diagnostic, right: &Diagnostic) -> Ordering {
@@ -530,24 +751,8 @@ fn compare_diagnostics(left: &Diagnostic, right: &Diagnostic) -> Ordering {
         ))
 }
 
-fn count_as_f64(value: usize) -> f64 {
-    // A report cannot hold more than u32::MAX records in practical memory.
-    // Saturating here avoids a precision-losing architecture-sized cast.
-    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
-}
-
 const fn mutation_status_rank(status: MutationStatus) -> u8 {
-    match status {
-        MutationStatus::Killed => 0,
-        MutationStatus::Survived => 1,
-        MutationStatus::NoCoverage => 2,
-        MutationStatus::CompileError => 3,
-        MutationStatus::RuntimeError => 4,
-        MutationStatus::Timeout => 5,
-        MutationStatus::Invalid => 6,
-        MutationStatus::Ignored => 7,
-        MutationStatus::Pending => 8,
-    }
+    status as u8
 }
 
 const fn severity_rank(severity: Severity) -> u8 {

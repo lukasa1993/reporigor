@@ -4,13 +4,14 @@ use std::time::Instant;
 
 use reporigor_core::{MutationCandidate, MutationResult, MutationStatus};
 
+use crate::command::{run_command_with_environment, MUTANT_FINGERPRINT_ENV, MUTANT_ID_ENV};
 use crate::filesystem::{
-    canonical_root, pending_mutation_locked, recover_active_locked, resolve_source_path, ApplyMutationError,
-    RunLockGuard, SourceRestoreGuard,
+    acquire_run_lock, acquire_shared_run_lock, canonical_root, pending_mutation_locked,
+    recover_active_locked, resolve_source_path, ApplyMutationError, RunLockGuard, SourceRestoreGuard,
 };
 use crate::{
-    run_command, BaselinePhase, BaselineReport, CommandOutcome, MutationError, MutationMode, MutationOptions,
-    MutationRun, PendingMutation, RecoveryAction,
+    run_command, BaselinePhase, BaselineReport, CommandOutcome, CommandSpec, MutationError, MutationMode,
+    MutationOptions, MutationRun, PendingMutation, RecoveryAction,
 };
 
 const MAX_EXECUTABLE_CANDIDATES: usize = 1_000_000;
@@ -28,9 +29,8 @@ pub struct MutationExecutor {
 /// before adapters inspect source, and keeps the lock until it is dropped.
 #[derive(Debug)]
 pub struct MutationExecutionSession {
-    root: PathBuf,
+    coordination: MutationSessionLock,
     recovery: RecoveryAction,
-    lock: RunLockGuard,
 }
 
 /// A shared coordination session held across read-only source analysis.
@@ -41,8 +41,30 @@ pub struct MutationExecutionSession {
 /// mutant while an analysis is reading the tree.
 #[derive(Debug)]
 pub struct MutationReadSession {
+    coordination: MutationSessionLock,
+}
+
+#[derive(Debug)]
+struct MutationSessionLock {
     root: PathBuf,
     lock: RunLockGuard,
+}
+
+#[derive(Clone, Copy)]
+enum SessionAccess {
+    Read,
+    Execute,
+}
+
+impl MutationSessionLock {
+    fn acquire(root: &Path, access: SessionAccess) -> Result<Self, MutationError> {
+        let root = canonical_root(root)?;
+        let lock = match access {
+            SessionAccess::Read => acquire_shared_run_lock(&root),
+            SessionAccess::Execute => acquire_run_lock(&root),
+        }?;
+        Ok(Self { root, lock })
+    }
 }
 
 impl MutationReadSession {
@@ -56,14 +78,12 @@ impl MutationReadSession {
     /// Returns an error when the root or persistent coordination state is
     /// unsafe, or an exclusive mutation execution currently holds the lock.
     pub fn begin(root: impl AsRef<Path>) -> Result<Self, MutationError> {
-        let root = canonical_root(root.as_ref())?;
-        let lock = RunLockGuard::acquire_shared(&root)?;
-        Ok(Self { root, lock })
+        begin_read_session(root.as_ref())
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.coordination.root
     }
 
     /// Inspect pending crash state while the shared analysis lock is held.
@@ -74,8 +94,13 @@ impl MutationReadSession {
     /// unsafe. Callers must treat either a returned journal or an error as a
     /// reason not to analyze source.
     pub fn pending_mutation(&self) -> Result<Option<PendingMutation>, MutationError> {
-        pending_mutation_locked(&self.root, self.lock.state())
+        pending_mutation_locked(&self.coordination.root, &self.coordination.lock.state)
     }
+}
+
+fn begin_read_session(root: &Path) -> Result<MutationReadSession, MutationError> {
+    let coordination = MutationSessionLock::acquire(root, SessionAccess::Read)?;
+    Ok(MutationReadSession { coordination })
 }
 
 impl MutationExecutionSession {
@@ -86,15 +111,17 @@ impl MutationExecutionSession {
     /// Returns an error when the root or persistent state is unsafe, another
     /// execution session is active, or recovery cannot be completed safely.
     pub fn begin(root: impl AsRef<Path>) -> Result<Self, MutationError> {
-        let root = canonical_root(root.as_ref())?;
-        let lock = RunLockGuard::acquire(&root)?;
-        let recovery = recover_active_locked(&root, lock.state())?;
-        Ok(Self { root, recovery, lock })
+        let coordination = MutationSessionLock::acquire(root.as_ref(), SessionAccess::Execute)?;
+        let recovery = recover_active_locked(&coordination.root, &coordination.lock.state)?;
+        Ok(Self {
+            coordination,
+            recovery,
+        })
     }
 
     #[must_use]
     pub fn root(&self) -> &Path {
-        &self.root
+        &self.coordination.root
     }
 
     #[must_use]
@@ -185,95 +212,121 @@ impl MutationExecutor {
         candidates: &[MutationCandidate],
         session: &MutationExecutionSession,
     ) -> Result<MutationRun, MutationError> {
-        if self.options.mode != MutationMode::Execute {
-            return Err(MutationError::InvalidOptions(
-                "a pre-analysis mutation session is valid only in execute mode".into(),
-            ));
-        }
-        if session.root != self.root {
-            return Err(MutationError::InvalidOptions(format!(
-                "mutation session root {} does not match executor root {}",
-                session.root.display(),
-                self.root.display()
-            )));
-        }
+        self.validate_session(session)?;
         self.options.cancellation.check()?;
         preflight_candidates(&self.root, candidates, &self.options)?;
-
-        let executable_count = executable_count(candidates, &self.options);
-        let baseline = if self.options.mode == MutationMode::Execute
-            && self.options.run_baseline
-            && executable_count > 0
-        {
-            self.run_baseline()?
-        } else {
-            BaselineReport::default()
-        };
-
-        let mut results = Vec::with_capacity(candidates.len());
-        let mut selected = 0_usize;
-        for candidate in candidates {
-            if self.options.ignored_ids.contains(&candidate.id) {
-                results.push(static_result(
-                    candidate,
-                    MutationStatus::Ignored,
-                    "candidate excluded by policy",
-                ));
-                continue;
-            }
-            if self.options.no_coverage_ids.contains(&candidate.id) {
-                results.push(static_result(
-                    candidate,
-                    MutationStatus::NoCoverage,
-                    "coverage data proves the candidate is not exercised",
-                ));
-                continue;
-            }
-            if self
-                .options
-                .max_mutants
-                .is_some_and(|maximum| selected >= maximum)
-            {
-                results.push(static_result(
-                    candidate,
-                    MutationStatus::Ignored,
-                    "candidate exceeds the max-mutants execution limit",
-                ));
-                continue;
-            }
-            selected += 1;
-            self.options.cancellation.check()?;
-            results.push(self.execute_candidate(candidate, session.lock.state())?);
-        }
-
+        let baseline = self.baseline_for(candidates)?;
+        let results = self.execute_candidates(candidates, &session.coordination.lock.state)?;
         Ok(MutationRun {
             root: self.root.clone(),
             mode: self.options.mode,
-            recovery: session.recovery,
+            recovery: session.recovery(),
             baseline,
             results,
         })
     }
 
+    fn validate_session(&self, session: &MutationExecutionSession) -> Result<(), MutationError> {
+        if self.options.mode != MutationMode::Execute {
+            return Err(MutationError::InvalidOptions(
+                "a pre-analysis mutation session is valid only in execute mode".into(),
+            ));
+        }
+        if session.root() != self.root {
+            return Err(MutationError::InvalidOptions(format!(
+                "mutation session root {} does not match executor root {}",
+                session.root().display(),
+                self.root.display()
+            )));
+        }
+        Ok(())
+    }
+
+    fn baseline_for(&self, candidates: &[MutationCandidate]) -> Result<BaselineReport, MutationError> {
+        if self.options.run_baseline && executable_count(candidates, &self.options) > 0 {
+            self.run_baseline()
+        } else {
+            Ok(BaselineReport::default())
+        }
+    }
+
+    fn execute_candidates(
+        &self,
+        candidates: &[MutationCandidate],
+        state: &Path,
+    ) -> Result<Vec<MutationResult>, MutationError> {
+        let mut results = Vec::with_capacity(candidates.len());
+        let mut selected = 0_usize;
+        for candidate in candidates {
+            if let Some(result) = self.nonexecuted_result(candidate, selected) {
+                results.push(result);
+                continue;
+            }
+            selected += 1;
+            self.options.cancellation.check()?;
+            results.push(self.execute_candidate(candidate, state)?);
+        }
+        Ok(results)
+    }
+
+    fn nonexecuted_result(&self, candidate: &MutationCandidate, selected: usize) -> Option<MutationResult> {
+        if self.options.ignored_ids.contains(&candidate.id) {
+            return Some(static_result(
+                candidate,
+                MutationStatus::Ignored,
+                "candidate excluded by policy",
+            ));
+        }
+        if self.options.no_coverage_ids.contains(&candidate.id) {
+            return Some(static_result(
+                candidate,
+                MutationStatus::NoCoverage,
+                "coverage data proves the candidate is not exercised",
+            ));
+        }
+        self.options
+            .max_mutants
+            .is_some_and(|maximum| selected >= maximum)
+            .then(|| {
+                static_result(
+                    candidate,
+                    MutationStatus::Ignored,
+                    "candidate exceeds the max-mutants execution limit",
+                )
+            })
+    }
+
     fn run_baseline(&self) -> Result<BaselineReport, MutationError> {
         self.options.cancellation.check()?;
-        let mut report = BaselineReport::default();
-        if let Some(command) = &self.options.validation_command {
-            let outcome = run_command(
-                command,
-                &self.root,
-                self.options.timeout,
-                self.options.output_limit_bytes,
-                &self.options.cancellation,
-            )?;
-            require_successful_baseline(BaselinePhase::Validation, &outcome)?;
-            report.validation = Some(outcome);
-        }
+        let validation = self.run_baseline_validation()?;
         self.options.cancellation.check()?;
+        let test = self.run_baseline_test()?;
+        Ok(BaselineReport {
+            validation,
+            test: Some(test),
+        })
+    }
+
+    fn run_baseline_validation(&self) -> Result<Option<CommandOutcome>, MutationError> {
+        let Some(command) = &self.options.validation_command else {
+            return Ok(None);
+        };
+        let outcome = self.run_baseline_command(command)?;
+        require_successful_baseline(BaselinePhase::Validation, &outcome)?;
+        Ok(Some(outcome))
+    }
+
+    fn run_baseline_test(&self) -> Result<CommandOutcome, MutationError> {
         let command =
             self.options.test_command.as_ref().ok_or_else(|| {
                 MutationError::InvalidOptions("execute mode requires a test command".into())
             })?;
+        let outcome = self.run_baseline_command(command)?;
+        require_successful_baseline(BaselinePhase::Test, &outcome)?;
+        Ok(outcome)
+    }
+
+    fn run_baseline_command(&self, command: &CommandSpec) -> Result<CommandOutcome, MutationError> {
         let outcome = run_command(
             command,
             &self.root,
@@ -281,9 +334,7 @@ impl MutationExecutor {
             self.options.output_limit_bytes,
             &self.options.cancellation,
         )?;
-        require_successful_baseline(BaselinePhase::Test, &outcome)?;
-        report.test = Some(outcome);
-        Ok(report)
+        Ok(outcome)
     }
 
     fn execute_candidate(
@@ -311,57 +362,62 @@ impl MutationExecutor {
             }
             Err(ApplyMutationError::Fatal(error)) => return Err(error),
         };
-
-        let result: Result<MutationResult, MutationError> =
-            if let Some(command) = &self.options.validation_command {
-                match run_command(
-                    command,
-                    &self.root,
-                    self.options.timeout,
-                    self.options.output_limit_bytes,
-                    &self.options.cancellation,
-                ) {
-                    Ok(outcome) if outcome.timed_out => Ok(mutation_result(
-                        candidate,
-                        MutationStatus::Timeout,
-                        &outcome,
-                        started,
-                        Some(detail_with_output(
-                            "validation command timed out",
-                            &outcome,
-                            self.options.output_limit_bytes,
-                        )),
-                    )),
-                    Ok(outcome) if outcome.exit_code != Some(0) => {
-                        let status = if outcome.exit_code.is_some() {
-                            MutationStatus::CompileError
-                        } else {
-                            MutationStatus::RuntimeError
-                        };
-                        Ok(mutation_result(
-                            candidate,
-                            status,
-                            &outcome,
-                            started,
-                            Some(detail_with_output(
-                                "validation command failed",
-                                &outcome,
-                                self.options.output_limit_bytes,
-                            )),
-                        ))
-                    }
-                    Ok(_) => self.run_test(candidate, started),
-                    Err(MutationError::Cancelled) => Err(MutationError::Cancelled),
-                    Err(error @ MutationError::ProcessTree { .. }) => Err(error),
-                    Err(error) => Ok(runtime_error_result(candidate, started, error.to_string())),
-                }
-            } else {
-                self.run_test(candidate, started)
-            };
-
+        let result = self.execute_applied_candidate(candidate, started);
         let restoration = guard.restore();
         restoration?;
         result
+    }
+
+    fn execute_applied_candidate(
+        &self,
+        candidate: &MutationCandidate,
+        started: Instant,
+    ) -> Result<MutationResult, MutationError> {
+        match &self.options.validation_command {
+            Some(command) => self.run_validation(command, candidate, started),
+            None => self.run_test(candidate, started),
+        }
+    }
+
+    fn run_validation(
+        &self,
+        command: &CommandSpec,
+        candidate: &MutationCandidate,
+        started: Instant,
+    ) -> Result<MutationResult, MutationError> {
+        match self.run_candidate_command(command, candidate) {
+            Ok(outcome) => self.classify_validation(candidate, started, &outcome),
+            Err(error) => classify_command_error(candidate, started, error),
+        }
+    }
+
+    fn classify_validation(
+        &self,
+        candidate: &MutationCandidate,
+        started: Instant,
+        outcome: &CommandOutcome,
+    ) -> Result<MutationResult, MutationError> {
+        if outcome.timed_out {
+            return Ok(command_failure_result(
+                candidate,
+                MutationStatus::Timeout,
+                outcome,
+                started,
+                "validation command timed out",
+                self.options.output_limit_bytes,
+            ));
+        }
+        if outcome.exit_code != Some(0) {
+            return Ok(command_failure_result(
+                candidate,
+                validation_failure_status(outcome),
+                outcome,
+                started,
+                "validation command failed",
+                self.options.output_limit_bytes,
+            ));
+        }
+        self.run_test(candidate, started)
     }
 
     fn run_test(
@@ -377,86 +433,140 @@ impl MutationExecutor {
                 "execute mode has no test command".into(),
             ));
         };
-        match run_command(
+        match self.run_candidate_command(command, candidate) {
+            Ok(outcome) => Ok(classify_test_outcome(
+                candidate,
+                started,
+                &outcome,
+                self.options.output_limit_bytes,
+            )),
+            Err(error) => classify_command_error(candidate, started, error),
+        }
+    }
+
+    fn run_candidate_command(
+        &self,
+        command: &CommandSpec,
+        candidate: &MutationCandidate,
+    ) -> Result<CommandOutcome, MutationError> {
+        let id = candidate.id.to_string();
+        run_command_with_environment(
             command,
             &self.root,
             self.options.timeout,
             self.options.output_limit_bytes,
             &self.options.cancellation,
-        ) {
-            Ok(outcome) if outcome.timed_out => Ok(mutation_result(
-                candidate,
-                MutationStatus::Timeout,
-                &outcome,
-                started,
-                Some(detail_with_output(
-                    "test command timed out",
-                    &outcome,
-                    self.options.output_limit_bytes,
-                )),
-            )),
-            Ok(outcome) if outcome.exit_code == Some(0) => Ok(mutation_result(
-                candidate,
-                MutationStatus::Survived,
-                &outcome,
-                started,
-                None,
-            )),
-            Ok(outcome) if outcome.exit_code.is_some() => Ok(mutation_result(
-                candidate,
-                MutationStatus::Killed,
-                &outcome,
-                started,
-                None,
-            )),
-            Ok(outcome) => Ok(mutation_result(
-                candidate,
-                MutationStatus::RuntimeError,
-                &outcome,
-                started,
-                Some(detail_with_output(
-                    "test command terminated without an exit code",
-                    &outcome,
-                    self.options.output_limit_bytes,
-                )),
-            )),
-            Err(MutationError::Cancelled) => Err(MutationError::Cancelled),
-            Err(error @ MutationError::ProcessTree { .. }) => Err(error),
-            Err(error) => Ok(runtime_error_result(candidate, started, error.to_string())),
-        }
+            &[
+                (MUTANT_ID_ENV, id.as_str()),
+                (MUTANT_FINGERPRINT_ENV, candidate.fingerprint.as_str()),
+            ],
+        )
+    }
+}
+
+fn validation_failure_status(outcome: &CommandOutcome) -> MutationStatus {
+    if outcome.exit_code.is_some() {
+        MutationStatus::CompileError
+    } else {
+        MutationStatus::RuntimeError
+    }
+}
+
+fn command_failure_result(
+    candidate: &MutationCandidate,
+    status: MutationStatus,
+    outcome: &CommandOutcome,
+    started: Instant,
+    prefix: &str,
+    output_limit_bytes: usize,
+) -> MutationResult {
+    mutation_result(
+        candidate,
+        status,
+        outcome,
+        started,
+        Some(detail_with_output(prefix, outcome, output_limit_bytes)),
+    )
+}
+
+fn classify_test_outcome(
+    candidate: &MutationCandidate,
+    started: Instant,
+    outcome: &CommandOutcome,
+    output_limit_bytes: usize,
+) -> MutationResult {
+    if outcome.timed_out {
+        return command_failure_result(
+            candidate,
+            MutationStatus::Timeout,
+            outcome,
+            started,
+            "test command timed out",
+            output_limit_bytes,
+        );
+    }
+    match outcome.exit_code {
+        Some(0) => mutation_result(candidate, MutationStatus::Survived, outcome, started, None),
+        Some(_) => mutation_result(candidate, MutationStatus::Killed, outcome, started, None),
+        None => command_failure_result(
+            candidate,
+            MutationStatus::RuntimeError,
+            outcome,
+            started,
+            "test command terminated without an exit code",
+            output_limit_bytes,
+        ),
+    }
+}
+
+fn classify_command_error(
+    candidate: &MutationCandidate,
+    started: Instant,
+    error: MutationError,
+) -> Result<MutationResult, MutationError> {
+    match error {
+        MutationError::Cancelled => Err(MutationError::Cancelled),
+        error @ MutationError::ProcessTree { .. } => Err(error),
+        error => Ok(runtime_error_result(candidate, started, error.to_string())),
     }
 }
 
 fn validate_options(options: &MutationOptions) -> Result<(), MutationError> {
     if options.mode == MutationMode::Execute {
-        if options.max_source_bytes == 0
-            || options.max_source_bytes > crate::filesystem::MAX_MUTATION_SOURCE_BYTES
-        {
-            return Err(MutationError::InvalidOptions(format!(
-                "execute-mode max_source_bytes must be between 1 and {} bytes",
-                crate::filesystem::MAX_MUTATION_SOURCE_BYTES
-            )));
-        }
-        let test = options
-            .test_command
-            .as_ref()
-            .ok_or_else(|| MutationError::InvalidOptions("execute mode requires a test command".into()))?;
-        if test.is_empty() {
-            return Err(MutationError::InvalidOptions(
-                "test command cannot be empty".into(),
-            ));
-        }
+        validate_execute_options(options)?;
     }
-    if options
-        .validation_command
-        .as_ref()
-        .is_some_and(crate::CommandSpec::is_empty)
+    validate_validation_command(options.validation_command.as_ref())
+}
+
+fn validate_execute_options(options: &MutationOptions) -> Result<(), MutationError> {
+    if options.max_source_bytes == 0
+        || options.max_source_bytes > crate::filesystem::MAX_MUTATION_SOURCE_BYTES
     {
+        return Err(MutationError::InvalidOptions(format!(
+            "execute-mode max_source_bytes must be between 1 and {} bytes",
+            crate::filesystem::MAX_MUTATION_SOURCE_BYTES
+        )));
+    }
+    let test = options
+        .test_command
+        .as_ref()
+        .ok_or_else(|| MutationError::InvalidOptions("execute mode requires a test command".into()))?;
+    if test.is_empty() {
         return Err(MutationError::InvalidOptions(
-            "validation command cannot be empty".into(),
+            "test command cannot be empty".into(),
         ));
     }
     Ok(())
+}
+
+fn validate_validation_command(command: Option<&CommandSpec>) -> Result<(), MutationError> {
+    if command.is_some_and(CommandSpec::is_empty) {
+        Err(MutationError::InvalidOptions(
+            "validation command cannot be empty".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 
 fn preflight_candidates(
@@ -464,23 +574,10 @@ fn preflight_candidates(
     candidates: &[MutationCandidate],
     options: &MutationOptions,
 ) -> Result<(), MutationError> {
-    if candidates.len() > MAX_EXECUTABLE_CANDIDATES {
-        return Err(MutationError::InvalidOptions(format!(
-            "mutation inventory contains {} candidates, exceeding the executable limit of {MAX_EXECUTABLE_CANDIDATES}",
-            candidates.len()
-        )));
-    }
+    validate_inventory_size(candidates.len())?;
     let mut ids = BTreeSet::new();
     for candidate in candidates {
-        if candidate.file.len() > MAX_CANDIDATE_PATH_BYTES
-            || candidate.original.len() > crate::filesystem::MAX_MUTATION_SOURCE_BYTES
-            || candidate.replacement.len() > crate::filesystem::MAX_MUTATION_SOURCE_BYTES
-        {
-            return Err(MutationError::InvalidOptions(format!(
-                "mutation candidate {} exceeds immutable path/text field limits",
-                candidate.id
-            )));
-        }
+        validate_candidate_size(candidate)?;
         if !ids.insert(candidate.id) {
             return Err(MutationError::InvalidOptions(format!(
                 "duplicate mutation candidate ID {}",
@@ -489,6 +586,35 @@ fn preflight_candidates(
         }
         resolve_source_path(root, &candidate.file, false)?;
     }
+    validate_selected_ids(&ids, options)
+}
+
+fn validate_inventory_size(candidate_count: usize) -> Result<(), MutationError> {
+    if candidate_count > MAX_EXECUTABLE_CANDIDATES {
+        Err(MutationError::InvalidOptions(format!(
+            "mutation inventory contains {candidate_count} candidates, exceeding the executable limit of {MAX_EXECUTABLE_CANDIDATES}"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_candidate_size(candidate: &MutationCandidate) -> Result<(), MutationError> {
+    let text_limit = crate::filesystem::MAX_MUTATION_SOURCE_BYTES;
+    if candidate.file.len() > MAX_CANDIDATE_PATH_BYTES
+        || candidate.original.len() > text_limit
+        || candidate.replacement.len() > text_limit
+    {
+        Err(MutationError::InvalidOptions(format!(
+            "mutation candidate {} exceeds immutable path/text field limits",
+            candidate.id
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_selected_ids(ids: &BTreeSet<u64>, options: &MutationOptions) -> Result<(), MutationError> {
     for id in options.ignored_ids.iter().chain(&options.no_coverage_ids) {
         if !ids.contains(id) {
             return Err(MutationError::InvalidOptions(format!(
@@ -592,6 +718,79 @@ fn detail_with_output(prefix: &str, outcome: &CommandOutcome, limit: usize) -> S
 /// restoring the original bytes.
 pub fn recover_active(root: impl AsRef<Path>) -> Result<RecoveryAction, MutationError> {
     let root = canonical_root(root.as_ref())?;
-    let lock = RunLockGuard::acquire(&root)?;
-    recover_active_locked(&root, lock.state())
+    let lock = acquire_run_lock(&root)?;
+    recover_active_locked(&root, &lock.state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{detail_with_output, validate_execute_options};
+    use crate::{CommandOutcome, CommandSpec, MutationError, MutationOptions};
+
+    struct DetailCase {
+        detail: &'static str,
+        captured: &'static str,
+        limit: usize,
+        expected: &'static str,
+    }
+
+    impl DetailCase {
+        const fn new(
+            detail: &'static str,
+            captured: &'static str,
+            limit: usize,
+            expected: &'static str,
+        ) -> Self {
+            Self {
+                detail,
+                captured,
+                limit,
+                expected,
+            }
+        }
+    }
+
+    #[test]
+    fn executor_helper_contracts_cover_diagnostics_and_option_boundaries() {
+        let output = |value: &str| CommandOutcome {
+            exit_code: Some(1),
+            timed_out: false,
+            duration_seconds: 0.0,
+            output: value.into(),
+            output_truncated: false,
+        };
+        let cases = [
+            DetailCase::new("failure", "", 64, "failure"),
+            DetailCase::new("failure", "detail", 0, "failure"),
+            DetailCase::new("failure", "detail", 9, "failure"),
+            DetailCase::new("x", "éz", 5, "x: z"),
+            DetailCase::new("x", "ok", 16, "x: ok"),
+        ];
+        for case in cases {
+            assert_eq!(
+                detail_with_output(case.detail, &output(case.captured), case.limit),
+                case.expected
+            );
+        }
+
+        let valid = MutationOptions::execute("test");
+        assert!(validate_execute_options(&valid).is_ok());
+
+        let mut invalid_limit = valid.clone();
+        invalid_limit.max_source_bytes = 0;
+        assert!(matches!(
+            validate_execute_options(&invalid_limit),
+            Err(MutationError::InvalidOptions(_))
+        ));
+        invalid_limit.max_source_bytes = crate::filesystem::MAX_MUTATION_SOURCE_BYTES + 1;
+        assert!(validate_execute_options(&invalid_limit).is_err());
+
+        let mut missing = valid.clone();
+        missing.test_command = None;
+        assert!(validate_execute_options(&missing).is_err());
+
+        let mut empty = valid;
+        empty.test_command = Some(CommandSpec::shell("  "));
+        assert!(validate_execute_options(&empty).is_err());
+    }
 }

@@ -53,51 +53,8 @@ pub fn mutation_elements_value(
         .mutate
         .as_ref()
         .ok_or(ReportError::MissingSection("mutation"))?;
-
-    let mut grouped: BTreeMap<&str, (Language, Vec<&MutationResult>)> = BTreeMap::new();
-    for mutant in &mutation.mutants {
-        let entry = grouped
-            .entry(&mutant.mutation.file)
-            .or_insert_with(|| (mutant.mutation.language, Vec::new()));
-        entry.1.push(mutant);
-    }
-
-    let mut files = BTreeMap::new();
-    for (file, (language, mut mutants)) in grouped {
-        let source = sources
-            .get(file)
-            .ok_or_else(|| ReportError::MissingMutationSource(file.to_owned()))?;
-        mutants.sort_by(|left, right| {
-            (
-                left.mutation.line,
-                left.mutation.column,
-                left.mutation.id,
-                &left.mutation.replacement,
-            )
-                .cmp(&(
-                    right.mutation.line,
-                    right.mutation.column,
-                    right.mutation.id,
-                    &right.mutation.replacement,
-                ))
-        });
-        for mutant in &mutants {
-            validate_mutant_span(mutant, source)?;
-        }
-        let positions = SourcePositionIndex::new(source, &mutants);
-        files.insert(
-            file.to_owned(),
-            MutationElementsFile {
-                language: mutation_language(language),
-                source: source.clone(),
-                mutants: mutants
-                    .into_iter()
-                    .map(|mutant| project_mutant(mutant, &positions))
-                    .collect::<Result<Vec<_>, _>>()?,
-            },
-        );
-    }
-
+    let grouped = group_mutants(&mutation.mutants);
+    let files = project_files(grouped, sources)?;
     let output = MutationElementsReport {
         schema_version: MUTATION_ELEMENTS_SCHEMA_VERSION,
         thresholds,
@@ -109,6 +66,76 @@ pub fn mutation_elements_value(
         },
     };
     Ok(serde_json::to_value(output)?)
+}
+
+fn group_mutants(mutants: &[MutationResult]) -> BTreeMap<&str, (Language, Vec<&MutationResult>)> {
+    let mut grouped = BTreeMap::new();
+    for mutant in mutants {
+        let entry = grouped
+            .entry(mutant.mutation.file.as_str())
+            .or_insert_with(|| (mutant.mutation.language, Vec::new()));
+        entry.1.push(mutant);
+    }
+    grouped
+}
+
+fn project_files(
+    grouped: BTreeMap<&str, (Language, Vec<&MutationResult>)>,
+    sources: &BTreeMap<String, String>,
+) -> Result<BTreeMap<String, MutationElementsFile>, ReportError> {
+    grouped
+        .into_iter()
+        .map(|(file, (language, mutants))| {
+            project_file(file, language, mutants, sources).map(|projected| (file.to_owned(), projected))
+        })
+        .collect()
+}
+
+fn project_file(
+    file: &str,
+    language: Language,
+    mut mutants: Vec<&MutationResult>,
+    sources: &BTreeMap<String, String>,
+) -> Result<MutationElementsFile, ReportError> {
+    let source = sources
+        .get(file)
+        .ok_or_else(|| ReportError::MissingMutationSource(file.to_owned()))?;
+    sort_mutants(&mut mutants);
+    validate_mutants(&mutants, source)?;
+    let positions = source_position_index(source, &mutants);
+    let mutants = mutants
+        .into_iter()
+        .map(|mutant| project_mutant(mutant, &positions))
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(MutationElementsFile {
+        language: mutation_language(language),
+        source: source.clone(),
+        mutants,
+    })
+}
+
+fn sort_mutants(mutants: &mut [&MutationResult]) {
+    mutants.sort_by(|left, right| {
+        (
+            left.mutation.line,
+            left.mutation.column,
+            left.mutation.id,
+            &left.mutation.replacement,
+        )
+            .cmp(&(
+                right.mutation.line,
+                right.mutation.column,
+                right.mutation.id,
+                &right.mutation.replacement,
+            ))
+    });
+}
+
+fn validate_mutants(mutants: &[&MutationResult], source: &str) -> Result<(), ReportError> {
+    for mutant in mutants {
+        validate_mutant_span(mutant, source)?;
+    }
+    Ok(())
 }
 
 /// Serialize the Mutation Testing Elements projection as deterministic pretty
@@ -138,9 +165,22 @@ const fn validate_thresholds(thresholds: MutationThresholds) -> Result<(), Repor
 
 fn validate_mutant_span(result: &MutationResult, source: &str) -> Result<(), ReportError> {
     let mutation = &result.mutation;
+    validate_span_order(result)?;
+    validate_span_bounds(result, source)?;
+    validate_span_boundaries(result, source)?;
+    validate_original_text(result, source, mutation.start_byte..mutation.end_byte)
+}
+
+fn validate_span_order(result: &MutationResult) -> Result<(), ReportError> {
+    let mutation = &result.mutation;
     if mutation.start_byte > mutation.end_byte {
         return Err(invalid_span(result, "the byte range is reversed"));
     }
+    Ok(())
+}
+
+fn validate_span_bounds(result: &MutationResult, source: &str) -> Result<(), ReportError> {
+    let mutation = &result.mutation;
     if mutation.end_byte > source.len() {
         return Err(invalid_span(
             result,
@@ -152,10 +192,26 @@ fn validate_mutant_span(result: &MutationResult, source: &str) -> Result<(), Rep
             ),
         ));
     }
-    if !source.is_char_boundary(mutation.start_byte) || !source.is_char_boundary(mutation.end_byte) {
+    Ok(())
+}
+
+fn validate_span_boundaries(result: &MutationResult, source: &str) -> Result<(), ReportError> {
+    let endpoints = [result.mutation.start_byte, result.mutation.end_byte];
+    if !endpoints
+        .into_iter()
+        .all(|offset| source.is_char_boundary(offset))
+    {
         return Err(invalid_span(result, "the byte range splits a UTF-8 scalar value"));
     }
-    if source.get(mutation.start_byte..mutation.end_byte) != Some(mutation.original.as_str()) {
+    Ok(())
+}
+
+fn validate_original_text(
+    result: &MutationResult,
+    source: &str,
+    range: std::ops::Range<usize>,
+) -> Result<(), ReportError> {
+    if source.get(range) != Some(result.mutation.original.as_str()) {
         return Err(invalid_span(
             result,
             "the original text does not match the supplied source at the byte range",
@@ -212,40 +268,6 @@ struct SourcePositionIndex {
 }
 
 impl SourcePositionIndex {
-    fn new(source: &str, mutants: &[&MutationResult]) -> Self {
-        let mut offsets = Vec::with_capacity(mutants.len().saturating_mul(2));
-        for mutant in mutants {
-            offsets.push(mutant.mutation.start_byte);
-            offsets.push(mutant.mutation.end_byte);
-        }
-        offsets.sort_unstable();
-        offsets.dedup();
-
-        let mut positions = Vec::with_capacity(offsets.len());
-        let mut requested = 0;
-        let mut line = 1_usize;
-        let mut column = 1_usize;
-        for (byte_offset, character) in source.char_indices() {
-            while offsets.get(requested) == Some(&byte_offset) {
-                positions.push((line, column));
-                requested += 1;
-            }
-            if character == '\n' {
-                line += 1;
-                column = 1;
-            } else {
-                column += 1;
-            }
-        }
-        while offsets.get(requested) == Some(&source.len()) {
-            positions.push((line, column));
-            requested += 1;
-        }
-        debug_assert_eq!(requested, offsets.len());
-        debug_assert_eq!(positions.len(), offsets.len());
-        Self { offsets, positions }
-    }
-
     fn position(
         &self,
         result: &MutationResult,
@@ -281,6 +303,49 @@ impl SourcePositionIndex {
     }
 }
 
+fn source_position_index(source: &str, mutants: &[&MutationResult]) -> SourcePositionIndex {
+    let offsets = requested_offsets(mutants);
+    let positions = scan_positions(source, &offsets);
+    debug_assert_eq!(positions.len(), offsets.len());
+    SourcePositionIndex { offsets, positions }
+}
+
+fn requested_offsets(mutants: &[&MutationResult]) -> Vec<usize> {
+    let mut offsets = Vec::with_capacity(mutants.len().saturating_mul(2));
+    for mutant in mutants {
+        offsets.push(mutant.mutation.start_byte);
+        offsets.push(mutant.mutation.end_byte);
+    }
+    offsets.sort_unstable();
+    offsets.dedup();
+    offsets
+}
+
+fn scan_positions(source: &str, offsets: &[usize]) -> Vec<(usize, usize)> {
+    let mut positions = Vec::with_capacity(offsets.len());
+    let mut requested = 0;
+    let mut line = 1_usize;
+    let mut column = 1_usize;
+    for (byte_offset, character) in source.char_indices() {
+        while offsets.get(requested) == Some(&byte_offset) {
+            positions.push((line, column));
+            requested += 1;
+        }
+        if character == '\n' {
+            line += 1;
+            column = 1;
+        } else {
+            column += 1;
+        }
+    }
+    while offsets.get(requested) == Some(&source.len()) {
+        positions.push((line, column));
+        requested += 1;
+    }
+    debug_assert_eq!(requested, offsets.len());
+    positions
+}
+
 fn invalid_span(result: &MutationResult, message: impl Into<String>) -> ReportError {
     ReportError::InvalidMutationSpan {
         id: result.mutation.id,
@@ -289,45 +354,48 @@ fn invalid_span(result: &MutationResult, message: impl Into<String>) -> ReportEr
     }
 }
 
-const fn mutation_status(status: MutationStatus) -> (&'static str, Option<&'static str>) {
-    match status {
-        MutationStatus::Killed => ("Killed", None),
-        MutationStatus::Survived => ("Survived", None),
-        MutationStatus::NoCoverage => ("NoCoverage", None),
-        MutationStatus::CompileError => ("CompileError", None),
-        MutationStatus::RuntimeError => ("RuntimeError", None),
-        MutationStatus::Timeout => ("Timeout", None),
-        MutationStatus::Invalid => (
-            "Ignored",
+fn mutation_status(status: MutationStatus) -> (String, Option<&'static str>) {
+    if status == MutationStatus::Invalid {
+        return (
+            "Ignored".to_owned(),
             Some("The mutation candidate was rejected before execution."),
-        ),
-        MutationStatus::Ignored => ("Ignored", None),
-        MutationStatus::Pending => ("Pending", None),
+        );
     }
+    (format!("{status:?}"), None)
 }
 
-const fn mutation_language(language: Language) -> &'static str {
-    match language {
-        Language::Bash => "bash",
-        Language::C => "c",
-        Language::Cpp => "cpp",
-        Language::ObjectiveC => "objectivec",
-        Language::Python => "python",
-        Language::Rust => "rust",
-        Language::Swift => "swift",
-        Language::TypeScript => "typescript",
-    }
+fn mutation_language(language: Language) -> &'static str {
+    crate::indexed_name(
+        "bash|c|cpp|objectivec|python|rust|swift|typescript",
+        language as usize,
+        "rust",
+    )
 }
 
 fn mutator_name(original: &str, replacement: &str) -> &'static str {
-    match (original, replacement) {
-        ("==" | "!=", "==" | "!=") => "EqualityOperator",
-        (">" | ">=" | "<" | "<=", ">" | ">=" | "<" | "<=") => "RelationalOperator",
-        ("&&" | "||" | "and" | "or", "&&" | "||" | "and" | "or") => "LogicalOperator",
-        ("true" | "false" | "True" | "False" | "YES" | "NO", _) => "BooleanLiteral",
-        ("+" | "-" | "*" | "/", "+" | "-" | "*" | "/") => "ArithmeticOperator",
-        _ => "GenericMutation",
-    }
+    binary_mutator_name(original, replacement)
+        .or_else(|| boolean_mutator_name(original))
+        .unwrap_or("GenericMutation")
+}
+
+fn binary_mutator_name(original: &str, replacement: &str) -> Option<&'static str> {
+    const CLASSES: &str =
+        "==,!=:EqualityOperator|>,>=,<,<=:RelationalOperator|&&,||,and,or:LogicalOperator|+,-,*,/:ArithmeticOperator";
+    CLASSES.split('|').find_map(|class| {
+        let (operators, name) = class.split_once(':')?;
+        same_operator_class(operators, original, replacement).then_some(name)
+    })
+}
+
+fn same_operator_class(operators: &str, original: &str, replacement: &str) -> bool {
+    let contains = |candidate| operators.split(',').any(|operator| operator == candidate);
+    contains(original) && contains(replacement)
+}
+
+fn boolean_mutator_name(original: &str) -> Option<&'static str> {
+    ["true", "false", "True", "False", "YES", "NO"]
+        .contains(&original)
+        .then_some("BooleanLiteral")
 }
 
 #[derive(Debug, Serialize)]
@@ -361,7 +429,7 @@ struct MutationElementsMutant {
     description: String,
     replacement: String,
     location: MutationLocation,
-    status: &'static str,
+    status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     status_reason: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

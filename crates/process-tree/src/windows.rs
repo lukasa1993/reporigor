@@ -66,49 +66,67 @@ pub(crate) fn attach(prepared: Prepared, child: &mut Child) -> Result<Containmen
     // escaping descendant before assignment finishes.
     if unsafe { AssignProcessToJobObject(job_handle, process_handle) } == 0 {
         let source = io::Error::last_os_error();
-        let cleanup_issues = abort_suspended_spawn(child, Some(job_handle), false);
-        return Err(PlatformSpawnError {
-            stage: SpawnStage::AssignProcess,
+        return Err(abort_attach(
+            child,
+            job_handle,
+            SpawnStage::AssignProcess,
             source,
-            cleanup_issues,
-        });
+            false,
+        ));
     }
 
     let thread_id = match locate_initial_thread(child.id()) {
         Ok(thread_id) => thread_id,
         Err(source) => {
-            let cleanup_issues = abort_suspended_spawn(child, Some(job_handle), true);
-            return Err(PlatformSpawnError {
-                stage: SpawnStage::LocatePrimaryThread,
+            return Err(abort_attach(
+                child,
+                job_handle,
+                SpawnStage::LocatePrimaryThread,
                 source,
-                cleanup_issues,
-            });
+                true,
+            ));
         }
     };
     let thread = match open_thread(thread_id) {
         Ok(thread) => thread,
         Err(source) => {
-            let cleanup_issues = abort_suspended_spawn(child, Some(job_handle), true);
-            return Err(PlatformSpawnError {
-                stage: SpawnStage::OpenPrimaryThread,
+            return Err(abort_attach(
+                child,
+                job_handle,
+                SpawnStage::OpenPrimaryThread,
                 source,
-                cleanup_issues,
-            });
+                true,
+            ));
         }
     };
     // SAFETY: `thread` is a live handle opened with THREAD_SUSPEND_RESUME for
     // the sole initial thread of our CREATE_SUSPENDED child.
     if unsafe { ResumeThread(thread.as_raw_handle().cast::<c_void>()) } == u32::MAX {
         let source = io::Error::last_os_error();
-        let cleanup_issues = abort_suspended_spawn(child, Some(job_handle), true);
-        return Err(PlatformSpawnError {
-            stage: SpawnStage::ResumePrimaryThread,
+        return Err(abort_attach(
+            child,
+            job_handle,
+            SpawnStage::ResumePrimaryThread,
             source,
-            cleanup_issues,
-        });
+            true,
+        ));
     }
 
     Ok(Containment { job: prepared.job })
+}
+
+fn abort_attach(
+    child: &mut Child,
+    job_handle: HANDLE,
+    stage: SpawnStage,
+    source: io::Error,
+    assigned: bool,
+) -> PlatformSpawnError {
+    PlatformSpawnError {
+        stage,
+        source,
+        cleanup_issues: abort_suspended_spawn(child, Some(job_handle), assigned),
+    }
 }
 
 pub(crate) fn observe_exit(

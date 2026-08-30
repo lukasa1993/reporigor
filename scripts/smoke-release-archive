@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+script_dir=$(dirname -- "$0")
+. "$script_dir/lib/common.sh"
+. "$script_dir/lib/smoke-archive.sh"
+
+smoke_release_archive_main "$@"

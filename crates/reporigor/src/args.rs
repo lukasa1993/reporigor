@@ -84,7 +84,7 @@ pub enum Command {
     Dry(DryArgs),
     /// List or execute syntax-aware mutations.
     Mutate(MutateArgs),
-    /// Run CRAP, duplication, and mutation discovery in one pass.
+    /// Run the integrated CRAP, DRY, mutation, structural, architecture, and baseline gate.
     Check(CheckArgs),
     /// Show language and external-provider availability.
     Providers(ProviderArgs),
@@ -98,10 +98,7 @@ pub struct CommonPath {
 }
 
 #[derive(Debug, Args)]
-pub struct CrapArgs {
-    #[command(flatten)]
-    pub common: CommonPath,
-
+pub struct CrapThresholdArgs {
     /// Existing LCOV, Cobertura, coverage.py, Istanbul, or LLVM export report.
     #[arg(long)]
     pub coverage: Option<PathBuf>,
@@ -114,6 +111,21 @@ pub struct CrapArgs {
         allow_negative_numbers = true
     )]
     pub fail_over: Option<f64>,
+}
+
+#[derive(Debug, Args)]
+pub struct CrapInputArgs {
+    #[command(flatten)]
+    pub common: CommonPath,
+
+    #[command(flatten)]
+    pub threshold: CrapThresholdArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct CrapArgs {
+    #[command(flatten)]
+    pub input: CrapInputArgs,
 
     #[arg(long)]
     pub allow_missing_coverage: bool,
@@ -202,17 +214,7 @@ pub struct MutateArgs {
 #[derive(Debug, Args)]
 pub struct CheckArgs {
     #[command(flatten)]
-    pub common: CommonPath,
-
-    #[arg(long)]
-    pub coverage: Option<PathBuf>,
-
-    #[arg(
-        long,
-        value_parser = parse_nonnegative_finite,
-        allow_negative_numbers = true
-    )]
-    pub fail_over: Option<f64>,
+    pub input: CrapInputArgs,
 
     #[arg(long, value_parser = parse_min_tokens)]
     pub min_tokens: Option<usize>,
@@ -235,17 +237,21 @@ pub struct ProviderArgs {
     pub preflight: bool,
 }
 
-fn parse_min_tokens(value: &str) -> Result<usize, String> {
-    parse_at_least(value, 4, "min-tokens")
+macro_rules! usize_parsers {
+    ($(($parser:ident, $minimum:literal, $name:literal)),+ $(,)?) => {
+        $(
+            pub(crate) fn $parser(value: &str) -> Result<usize, String> {
+                parse_at_least(value, $minimum, $name)
+            }
+        )+
+    };
 }
 
-fn parse_positive(value: &str) -> Result<usize, String> {
-    parse_at_least(value, 1, "value")
-}
-
-fn parse_occurrence_limit(value: &str) -> Result<usize, String> {
-    parse_at_least(value, 2, "max-occurrences-per-window")
-}
+usize_parsers!(
+    (parse_min_tokens, 4, "min-tokens"),
+    (parse_positive, 1, "value"),
+    (parse_occurrence_limit, 2, "max-occurrences-per-window"),
+);
 
 fn parse_at_least(value: &str, minimum: usize, name: &str) -> Result<usize, String> {
     let parsed = value
@@ -258,9 +264,7 @@ fn parse_at_least(value: &str, minimum: usize, name: &str) -> Result<usize, Stri
 }
 
 pub(crate) fn parse_nonnegative_finite(value: &str) -> Result<f64, String> {
-    let parsed = value
-        .parse::<f64>()
-        .map_err(|error| format!("invalid number {value:?}: {error}"))?;
+    let parsed = parse_number(value)?;
     if !parsed.is_finite() || parsed < 0.0 {
         return Err("value must be a non-negative finite number".to_string());
     }
@@ -268,10 +272,14 @@ pub(crate) fn parse_nonnegative_finite(value: &str) -> Result<f64, String> {
 }
 
 pub(crate) fn parse_positive_duration(value: &str) -> Result<Duration, String> {
-    let parsed = value
-        .parse::<f64>()
-        .map_err(|error| format!("invalid number {value:?}: {error}"))?;
+    let parsed = parse_number(value)?;
     checked_duration_from_secs_f64(parsed).map_err(|error| format!("timeout {error}"))
+}
+
+fn parse_number(value: &str) -> Result<f64, String> {
+    value
+        .parse::<f64>()
+        .map_err(|error| format!("invalid number {value:?}: {error}"))
 }
 
 #[cfg(test)]
@@ -281,51 +289,44 @@ mod tests {
     use super::Cli;
 
     #[test]
-    fn mutation_mode_and_limits_are_validated_during_argument_parsing() {
-        assert!(Cli::try_parse_from(["reporigor", "mutate", ".", "--list", "--run"]).is_err());
-        assert!(Cli::try_parse_from(["reporigor", "mutate", ".", "--recover"]).is_ok());
-        assert!(
-            Cli::try_parse_from(["reporigor", "mutate", ".", "--recover", "--test-command", "true",])
-                .is_err()
-        );
-        assert!(Cli::try_parse_from(["reporigor", "mutate", ".", "--run", "--max-mutants", "0"]).is_err());
+    fn argument_conflicts_and_numeric_limits_are_validated_during_parsing() {
+        let parse_encoded = |arguments: &str| Cli::try_parse_from(arguments.split('|'));
+        let assert_parse_result = |arguments: &str, succeeds| {
+            assert_eq!(
+                parse_encoded(arguments).is_ok(),
+                succeeds,
+                "unexpected parse result for {arguments:?}"
+            );
+        };
+        for invalid in [
+            "--list|--run",
+            "--recover|--test-command|true",
+            "--run|--max-mutants|0",
+            "--no-validate|--validate-command|cargo check",
+        ] {
+            assert_parse_result(&format!("reporigor|mutate|.|{invalid}"), false);
+        }
+        for valid in ["--recover", "--no-validate"] {
+            assert_parse_result(&format!("reporigor|mutate|.|{valid}"), true);
+        }
+        assert_parse_result("reporigor|crap|.|--fail-over|NaN", false);
+        assert_parse_result("reporigor|check|.|--fail-over=-1", false);
+        assert_parse_result("reporigor|crap|.|--fail-over|0", true);
         for timeout in ["NaN", "0", "1e300", "5e-324"] {
+            let arguments = ["reporigor", "mutate", ".", "--timeout", timeout];
             assert!(
-                Cli::try_parse_from(["reporigor", "mutate", ".", "--timeout", timeout]).is_err(),
-                "{timeout} must fail during argument parsing"
+                Cli::try_parse_from(arguments).is_err(),
+                "invalid timeout: {timeout}"
             );
         }
-    }
 
-    #[test]
-    fn crap_threshold_must_be_finite_and_nonnegative() {
-        assert!(Cli::try_parse_from(["reporigor", "crap", ".", "--fail-over", "NaN"]).is_err());
-        assert!(Cli::try_parse_from(["reporigor", "check", ".", "--fail-over=-1"]).is_err());
-        assert!(Cli::try_parse_from(["reporigor", "crap", ".", "--fail-over", "0"]).is_ok());
-    }
-
-    #[test]
-    fn no_validate_overrides_only_the_validation_command() {
-        assert!(Cli::try_parse_from([
-            "reporigor",
-            "mutate",
-            ".",
-            "--no-validate",
-            "--validate-command",
-            "cargo check",
-        ])
-        .is_err());
-        assert!(Cli::try_parse_from(["reporigor", "mutate", ".", "--no-validate"]).is_ok());
-    }
-
-    #[test]
-    fn project_execution_requires_an_explicit_global_flag() {
-        let default = Cli::try_parse_from(["reporigor", "check", "."])
-            .unwrap_or_else(|error| panic!("default CLI: {error}"));
-        assert!(!default.allow_project_exec);
-
-        let allowed = Cli::try_parse_from(["reporigor", "check", ".", "--allow-project-exec"])
-            .unwrap_or_else(|error| panic!("explicit project execution: {error}"));
-        assert!(allowed.allow_project_exec);
+        for (arguments, expected) in [
+            ("reporigor|check|.", false),
+            ("reporigor|check|.|--allow-project-exec", true),
+        ] {
+            let parsed =
+                parse_encoded(arguments).unwrap_or_else(|error| panic!("fixture CLI must parse: {error}"));
+            assert_eq!(parsed.allow_project_exec, expected);
+        }
     }
 }

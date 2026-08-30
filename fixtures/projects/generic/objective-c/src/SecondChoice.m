@@ -1,12 +1,14 @@
 @interface SecondChoice
-- (int)choose:(int)left other:(int)right;
 @end
 
 @implementation SecondChoice
 - (int)choose:(int)left other:(int)right {
-  if (left > 0 && right != 0) {
-    return left + right;
+  int result = left + right;
+  int threshold = 25;
+  result = result * 3;
+  if (left > 1 && right != 2) {
+    result = result + threshold;
   }
-  return 0;
+  return result;
 }
 @end

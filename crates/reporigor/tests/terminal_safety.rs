@@ -2,31 +2,41 @@ use std::error::Error;
 use std::fs;
 use std::process::{Command, Stdio};
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
+pub mod support;
+use support::fixtures::{retained_python_project, write_executable_fixture, write_fixture};
+use support::invocation::run_at;
+use support::success_assertion::assert_success;
 
 #[cfg(unix)]
 #[test]
 fn provider_text_escapes_tool_control_sequences_but_json_preserves_data() -> Result<(), Box<dyn Error>> {
+    let project = hostile_provider_project()?;
+    assert_provider_text_escaping(project.path())?;
+    assert_provider_json_data(project.path())?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn hostile_provider_project() -> Result<tempfile::TempDir, Box<dyn Error>> {
     let project = tempfile::tempdir()?;
-    fs::write(
-        project.path().join("pyproject.toml"),
+    write_fixture(
+        &project.path().join("pyproject.toml"),
         "[project]\nname = \"terminal-safety\"\nversion = \"0.1.0\"\n",
-    )?;
-    fs::write(project.path().join("sample.py"), "value = 1\n")?;
+    );
+    write_fixture(&project.path().join("sample.py"), "value = 1\n");
     let executable = project.path().join(".venv/bin/mutmut");
-    fs::create_dir_all(executable.parent().ok_or("mutmut parent")?)?;
-    fs::write(
+    write_executable_fixture(
         &executable,
         "#!/bin/sh\nprintf 'hostile\\033[31m\\t\\302\\205\\342\\200\\256' >&2\nexit 23\n",
     )?;
-    let mut permissions = fs::metadata(&executable)?.permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&executable, permissions)?;
+    Ok(project)
+}
 
+#[cfg(unix)]
+fn assert_provider_text_escaping(project: &std::path::Path) -> Result<(), Box<dyn Error>> {
     let text = Command::new(env!("CARGO_BIN_EXE_reporigor"))
         .args(["providers", "--preflight"])
-        .arg(project.path())
+        .arg(project)
         .output()?;
     assert_success(&text, "provider text");
     let text = String::from_utf8(text.stdout)?;
@@ -36,11 +46,12 @@ fn provider_text_escapes_tool_control_sequences_but_json_preserves_data() -> Res
     for escaped in [r"\u{1b}", r"\u{9}", r"\u{85}", r"\u{202e}"] {
         assert!(text.contains(escaped), "provider text omitted {escaped}: {text}");
     }
+    Ok(())
+}
 
-    let json = Command::new(env!("CARGO_BIN_EXE_reporigor"))
-        .args(["--format", "json", "providers", "--preflight"])
-        .arg(project.path())
-        .output()?;
+#[cfg(unix)]
+fn assert_provider_json_data(project: &std::path::Path) -> Result<(), Box<dyn Error>> {
+    let json = run_at(&["--format", "json", "providers", "--preflight"], project)?;
     assert_success(&json, "provider JSON");
     let json: serde_json::Value = serde_json::from_slice(&json.stdout)?;
     let reason = json["mutation"]["providers"]
@@ -67,10 +78,10 @@ fn runtime_errors_escape_repo_controlled_filenames_for_unified_and_legacy_entryp
     let hostile = "forged-line\n\u{1b}[31m\u{202e}.py";
     fs::write(project.path().join(hostile), "def broken(:\n")?;
 
-    let unified = Command::new(env!("CARGO_BIN_EXE_reporigor"))
-        .args(["--backend", "generic", "--language", "python", "dry"])
-        .arg(project.path())
-        .output()?;
+    let unified = run_at(
+        &["--backend", "generic", "--language", "python", "dry"],
+        project.path(),
+    )?;
     assert_escaped_error(&unified, "unified error");
 
     let legacy = Command::new(env!("CARGO_BIN_EXE_dry4python"))
@@ -83,22 +94,10 @@ fn runtime_errors_escape_repo_controlled_filenames_for_unified_and_legacy_entryp
 
 #[test]
 fn closed_terminal_streams_do_not_turn_expected_exits_into_panics() -> Result<(), Box<dyn Error>> {
-    let project = tempfile::tempdir()?;
-    fs::write(
-        project.path().join("sample.py"),
-        "def retained(value):\n    return value + 1\n",
-    )?;
+    let project = retained_python_project();
 
     let mut success = Command::new(env!("CARGO_BIN_EXE_reporigor"))
-        .args([
-            "--backend",
-            "generic",
-            "--language",
-            "python",
-            "dry",
-            "--min-tokens",
-            "1000",
-        ])
+        .args("--backend|generic|--language|python|dry|--min-tokens|1000".split('|'))
         .arg(project.path())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -143,14 +142,5 @@ fn assert_escaped_error(output: &std::process::Output, context: &str) {
     assert!(
         stderr.contains(r"forged-line\u{a}\u{1b}[31m\u{202e}.py"),
         "{context} omitted escaped path: {stderr:?}"
-    );
-}
-
-fn assert_success(output: &std::process::Output, context: &str) {
-    assert!(
-        output.status.success(),
-        "{context} failed\nstdout:\n{}\nstderr:\n{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
     );
 }

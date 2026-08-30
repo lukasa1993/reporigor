@@ -1,10 +1,11 @@
-use std::env;
-use std::ffi::{OsStr, OsString};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
-use std::process::{self, Command};
+use std::{
+    env,
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+    process::{self, Command},
+};
 
-use reporigor_reporting::escape_terminal_text;
+use reporigor::write_terminal_error;
 
 fn main() {
     let mut arguments = env::args_os();
@@ -68,5 +69,5 @@ fn launch_error(reporigor: &Path, error: &std::io::Error) -> ! {
 }
 
 fn write_launcher_error(message: &str) {
-    let _result = writeln!(io::stderr().lock(), "{}", escape_terminal_text(message));
+    write_terminal_error(message);
 }

@@ -6,8 +6,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use reporigor_core::SourceFile;
-use reporigor_process_tree::{CleanupPolicy, ProcessTree, SpawnError, WaitReason};
+use reporigor_process_tree::{CleanupPolicy, ProcessTree, SpawnError, WaitError, WaitOutcome, WaitReason};
 
+use crate::command::direct_command;
 use crate::{sanitize_compile_command, ClangLanguage, CompileCommand, SanitizedCommand};
 
 const MAX_CAPTURE_BYTES: usize = 64 * 1024;
@@ -23,24 +24,36 @@ pub(crate) struct CapturedOutput {
 /// rejection, timeout, and a compiler diagnostic are intentionally distinct so
 /// an orchestrator can make an explicit fallback decision.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "inspect the compiler validation outcome"]
 pub enum ValidationStatus {
+    #[doc = "Clang accepted the translation unit."]
     Valid,
-    Invalid { exit_code: Option<i32>, stderr: String },
-    TimedOut { timeout: Duration, stderr: String },
-    Unavailable { message: String },
+    #[doc = "Command sanitization rejected unsafe compiler arguments."]
     Rejected { message: String },
+    #[doc = "Clang ran and rejected the translation unit."]
+    Invalid { exit_code: Option<i32>, stderr: String },
+    #[doc = "Validation was explicitly disabled by the caller."]
     NotValidated { message: String },
+    #[doc = "Clang exceeded the configured validation deadline."]
+    TimedOut { timeout: Duration, stderr: String },
+    #[doc = "The compiler process could not be started or observed."]
+    Unavailable { message: String },
 }
 
 /// A compilation-database record resolved against the requested project, with
 /// both original and actual validation command provenance.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use = "inspect the command provenance and validation status"]
 pub struct TranslationUnit {
-    pub command_index: usize,
+    /// Original compilation-database command for this unit.
     pub command: CompileCommand,
-    pub language: Option<ClangLanguage>,
-    pub source: Option<SourceFile>,
+    pub command_index: usize,
+    /// Sanitized compiler invocation actually executed, when available.
     pub invocation: Option<SanitizedCommand>,
+    pub source: Option<SourceFile>,
+    /// Language selected from explicit flags or source extension.
+    pub language: Option<ClangLanguage>,
+    /// Result of validating this translation unit with Clang.
     pub status: ValidationStatus,
     pub elapsed: Duration,
 }
@@ -69,41 +82,53 @@ pub(crate) fn validate_translation_unit(
 }
 
 pub(crate) fn probe_compiler_version(compiler: &Path, timeout: Duration) -> Result<String, String> {
-    let invocation = SanitizedCommand::direct(
+    let invocation = direct_command(
         compiler.to_path_buf(),
         vec!["--version".to_string()],
         std::env::current_dir().map_err(|error| error.to_string())?,
     );
-    match run_bounded_capture(&invocation, timeout, Some(MAX_CAPTURE_BYTES), MAX_CAPTURE_BYTES) {
+    let outcome = run_bounded_capture(&invocation, timeout, Some(MAX_CAPTURE_BYTES), MAX_CAPTURE_BYTES);
+    match outcome {
         ProcessOutcome::Exited {
             success: true,
             stdout,
             stderr,
             exit_code: _,
-        } => Ok(if stdout.text.trim().is_empty() {
-            &stderr.text
-        } else {
-            &stdout.text
-        }
+        } => Ok(version_text(&stdout, &stderr)),
+        failure => Err(version_failure(compiler, timeout, failure)),
+    }
+}
+
+fn version_text(stdout: &CapturedOutput, stderr: &CapturedOutput) -> String {
+    let output = if stdout.text.trim().is_empty() {
+        &stderr.text
+    } else {
+        &stdout.text
+    };
+    output
         .lines()
         .next()
         .unwrap_or("unknown Clang version")
         .trim()
-        .to_string()),
+        .to_string()
+}
+
+fn version_failure(compiler: &Path, timeout: Duration, outcome: ProcessOutcome) -> String {
+    match outcome {
         ProcessOutcome::Exited {
             exit_code, stderr, ..
-        } => Err(format!(
+        } => format!(
             "{} --version exited with {:?}: {}",
             compiler.display(),
             exit_code,
             compact(&stderr.text)
-        )),
-        ProcessOutcome::TimedOut { .. } => Err(format!(
+        ),
+        ProcessOutcome::TimedOut { .. } => format!(
             "{} --version timed out after {:.3}s",
             compiler.display(),
             timeout.as_secs_f64()
-        )),
-        ProcessOutcome::Unavailable(message) => Err(message),
+        ),
+        ProcessOutcome::Unavailable(message) => message,
     }
 }
 
@@ -144,18 +169,37 @@ pub(crate) fn run_bounded_capture(
     stdout_limit: Option<usize>,
     stderr_limit: usize,
 ) -> ProcessOutcome {
+    let mut command = configured_process(invocation, stdout_limit.is_some());
+    let mut child = match ProcessTree::spawn(&mut command) {
+        Ok(child) => child,
+        Err(error) => return ProcessOutcome::Unavailable(spawn_failure_message(invocation, &error)),
+    };
+    let readers = match capture_readers(&mut child, invocation, stdout_limit, stderr_limit) {
+        Ok(readers) => readers,
+        Err(outcome) => return outcome,
+    };
+    let wait_result = child.wait_bounded(timeout, CleanupPolicy::default());
+    finish_process(wait_result, readers, invocation)
+}
+
+fn configured_process(invocation: &SanitizedCommand, capture_stdout: bool) -> Command {
     let mut command = Command::new(&invocation.program);
     command
         .args(&invocation.arguments)
         .current_dir(&invocation.directory)
         .stdin(Stdio::null())
         .stderr(Stdio::piped())
-        .stdout(if stdout_limit.is_some() {
+        .stdout(if capture_stdout {
             Stdio::piped()
         } else {
             Stdio::null()
         });
-    if let Some(scratch) = invocation.scratch_directory() {
+    configure_scratch(&mut command, invocation.scratch_directory());
+    command
+}
+
+fn configure_scratch(command: &mut Command, scratch: Option<&Path>) {
+    if let Some(scratch) = scratch {
         // Clang and its platform libraries consult different temporary-file
         // variables. Point all of them at the same RAII-owned directory so a
         // syntax-only process cannot spill temporary artifacts into the
@@ -165,30 +209,57 @@ pub(crate) fn run_bounded_capture(
             .env("TMP", scratch)
             .env("TEMP", scratch);
     }
-    let mut child = match ProcessTree::spawn(&mut command) {
-        Ok(child) => child,
-        Err(error) => {
-            return ProcessOutcome::Unavailable(spawn_failure_message(invocation, &error));
-        }
-    };
+}
 
-    let Some(stderr) = child.take_stderr() else {
-        return ProcessOutcome::Unavailable(missing_pipe_message(&mut child, invocation, "stderr"));
+struct ProcessReaders {
+    stdout: Option<OutputReader>,
+    stderr: Option<OutputReader>,
+}
+
+fn capture_readers(
+    child: &mut ProcessTree,
+    invocation: &SanitizedCommand,
+    stdout_limit: Option<usize>,
+    stderr_limit: usize,
+) -> Result<ProcessReaders, ProcessOutcome> {
+    let stderr_pipe = child.take_stderr();
+    let stderr = require_pipe(stderr_pipe, child, invocation, "stderr")?;
+    let stdout = capture_stdout(child, invocation, stdout_limit)?;
+    Ok(ProcessReaders {
+        stdout,
+        stderr: Some(spawn_reader(stderr, stderr_limit)),
+    })
+}
+
+fn capture_stdout(
+    child: &mut ProcessTree,
+    invocation: &SanitizedCommand,
+    limit: Option<usize>,
+) -> Result<Option<OutputReader>, ProcessOutcome> {
+    let Some(limit) = limit else {
+        return Ok(None);
     };
-    let stdout = match stdout_limit {
-        Some(limit) => {
-            let Some(stdout) = child.take_stdout() else {
-                return ProcessOutcome::Unavailable(missing_pipe_message(&mut child, invocation, "stdout"));
-            };
-            Some((stdout, limit))
-        }
-        None => None,
-    };
-    let stderr_reader = Some(spawn_reader(stderr, stderr_limit));
-    let stdout_reader = stdout.map(|(reader, limit)| spawn_reader(reader, limit));
-    let wait_result = child.wait_bounded(timeout, CleanupPolicy::default());
-    let stdout = join_reader(stdout_reader);
-    let stderr = join_reader(stderr_reader);
+    let stdout_pipe = child.take_stdout();
+    let stdout = require_pipe(stdout_pipe, child, invocation, "stdout")?;
+    Ok(Some(spawn_reader(stdout, limit)))
+}
+
+fn require_pipe<T>(
+    pipe: Option<T>,
+    child: &mut ProcessTree,
+    invocation: &SanitizedCommand,
+    name: &str,
+) -> Result<T, ProcessOutcome> {
+    pipe.ok_or_else(|| ProcessOutcome::Unavailable(missing_pipe_message(child, invocation, name)))
+}
+
+fn finish_process(
+    wait_result: Result<WaitOutcome, WaitError>,
+    readers: ProcessReaders,
+    invocation: &SanitizedCommand,
+) -> ProcessOutcome {
+    let stdout = join_reader(readers.stdout);
+    let stderr = join_reader(readers.stderr);
     match wait_result {
         Ok(outcome) if outcome.reason == WaitReason::Exited => ProcessOutcome::Exited {
             success: outcome.status.success(),
@@ -206,17 +277,18 @@ pub(crate) fn run_bounded_capture(
 }
 
 fn spawn_failure_message(invocation: &SanitizedCommand, error: &SpawnError) -> String {
-    let base = format!("failed to start {}: {error}", invocation.program.display());
     let cleanup = error
         .cleanup_issues()
         .iter()
         .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join("; ");
-    if cleanup.is_empty() {
-        base
-    } else {
-        format!("{base}; {cleanup}")
+    match cleanup.as_str() {
+        "" => format!("failed to start {}: {error}", invocation.program.display()),
+        details => format!(
+            "failed to start {}: {error}; {details}",
+            invocation.program.display()
+        ),
     }
 }
 
@@ -246,11 +318,11 @@ fn spawn_reader<R>(mut reader: R, limit: usize) -> OutputReader
 where
     R: Read + Send + 'static,
 {
+    let (completed_sender, completed) = mpsc::channel();
     let snapshot = Arc::new(Mutex::new(CaptureBuffer::default()));
     let thread_snapshot = Arc::clone(&snapshot);
-    let (completed_sender, completed) = mpsc::channel();
     let _reader_thread = thread::spawn(move || {
-        let mut buffer = [0_u8; 8192];
+        let mut buffer = [0_u8; 4096 * 2];
         loop {
             match reader.read(&mut buffer) {
                 Ok(0) | Err(_) => break,
@@ -330,54 +402,44 @@ fn compact(value: &str) -> String {
 #[cfg(all(test, unix))]
 mod tests {
     use std::fs;
-    use std::os::unix::fs::PermissionsExt;
-
-    use tempfile::tempdir;
 
     use super::*;
+    use crate::test_support::{
+        compile_command, create_dir, executable_fixture, expect_error, temp_dir, write,
+    };
     use crate::CommandOrigin;
 
-    fn make_script(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        let script = temp.path().join("fake-clang");
-        fs::write(&script, contents).unwrap_or_else(|error| panic!("write script: {error}"));
-        let mut permissions = fs::metadata(&script)
-            .unwrap_or_else(|error| panic!("metadata: {error}"))
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&script, permissions).unwrap_or_else(|error| panic!("permissions: {error}"));
-        (temp, script)
+    fn command(directory: &Path) -> CompileCommand {
+        compile_command(directory, "source.c", &["clang", "source.c", "-c"])
     }
 
-    fn command(directory: &Path) -> CompileCommand {
-        let arguments = vec!["clang".to_string(), "source.c".to_string(), "-c".to_string()];
-        CompileCommand {
-            directory: directory.to_path_buf(),
-            file: directory.join("source.c"),
-            origin: CommandOrigin::Arguments(arguments.clone()),
-            arguments,
-            output: None,
-        }
+    fn validation_status(directory: &Path, compiler: &Path, timeout: Duration) -> ValidationStatus {
+        validate_translation_unit(&command(directory), ClangLanguage::C, compiler, timeout).1
+    }
+
+    fn capture(invocation: &SanitizedCommand, timeout: Duration) -> ProcessOutcome {
+        run_bounded_capture(invocation, timeout, Some(MAX_CAPTURE_BYTES), MAX_CAPTURE_BYTES)
+    }
+
+    fn script_status(contents: &str, timeout: Duration) -> (tempfile::TempDir, ValidationStatus) {
+        let (temp, compiler) = executable_fixture(contents);
+        write(temp.path().join("source.c"), "int main(void) { return 0; }");
+        let status = validation_status(temp.path(), &compiler, timeout);
+        (temp, status)
+    }
+
+    fn probe_script(contents: &str, timeout: Duration) -> Result<String, String> {
+        let (_temp, compiler) = executable_fixture(contents);
+        probe_compiler_version(&compiler, timeout)
     }
 
     #[test]
     fn reports_valid_and_invalid_translation_units() {
-        let (temp, valid) = make_script("#!/bin/sh\nexit 0\n");
-        fs::write(temp.path().join("source.c"), "int main(void) { return 0; }")
-            .unwrap_or_else(|error| panic!("write source: {error}"));
-        let (_, valid_status, _) = validate_translation_unit(
-            &command(temp.path()),
-            ClangLanguage::C,
-            &valid,
-            Duration::from_secs(1),
-        );
+        let (_valid_temp, valid_status) = script_status("#!/bin/sh\nexit 0\n", Duration::from_secs(1));
         assert_eq!(valid_status, ValidationStatus::Valid);
 
-        let (invalid_temp, invalid) = make_script("#!/bin/sh\necho parse-failed >&2\nexit 7\n");
-        let (_, invalid_status, _) = validate_translation_unit(
-            &command(invalid_temp.path()),
-            ClangLanguage::C,
-            &invalid,
+        let (_invalid_temp, invalid_status) = script_status(
+            "#!/bin/sh\necho parse-failed >&2\nexit 7\n",
             Duration::from_secs(1),
         );
         assert!(matches!(
@@ -391,36 +453,28 @@ mod tests {
 
     #[test]
     fn kills_a_translation_unit_at_the_configured_timeout() {
-        let (temp, compiler) = make_script("#!/bin/sh\nexec sleep 2\n");
         let started = Instant::now();
-        let (_, status, _) = validate_translation_unit(
-            &command(temp.path()),
-            ClangLanguage::C,
-            &compiler,
-            Duration::from_millis(50),
-        );
-        assert!(matches!(status, ValidationStatus::TimedOut { .. }));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        let (_temp, status) = script_status("#!/bin/sh\nexec sleep 2\n", Duration::from_millis(50));
+        let elapsed = started.elapsed();
+        assert!(matches!(status, ValidationStatus::TimedOut { .. }) && elapsed < Duration::from_secs(1));
     }
 
     #[test]
     fn timeout_kills_descendants_before_they_can_escape_side_effects() {
-        let (temp, compiler) =
-            make_script("#!/bin/sh\nmarker=$1\n( sleep 0.3; printf leaked > \"$marker\" ) &\nsleep 10\n");
+        let (temp, compiler) = executable_fixture(
+            "#!/bin/sh\nmarker=$1\n( sleep 0.3; printf leaked > \"$marker\" ) &\nsleep 10\n",
+        );
         let marker = temp.path().join("descendant-marker");
-        let invocation = SanitizedCommand::direct(
+        let invocation = direct_command(
             compiler,
             vec![marker.to_string_lossy().into_owned()],
             temp.path().to_path_buf(),
         );
 
-        let outcome = run_bounded_capture(
-            &invocation,
-            Duration::from_millis(50),
-            Some(MAX_CAPTURE_BYTES),
-            MAX_CAPTURE_BYTES,
-        );
-        assert!(matches!(outcome, ProcessOutcome::TimedOut { .. }));
+        match capture(&invocation, Duration::from_millis(50)) {
+            ProcessOutcome::TimedOut { .. } => {}
+            outcome => panic!("expected timeout, got {outcome:?}"),
+        }
         thread::sleep(Duration::from_millis(500));
         assert!(
             !marker.exists(),
@@ -430,16 +484,11 @@ mod tests {
 
     #[test]
     fn successful_parent_with_descendant_holding_pipes_does_not_hang() {
-        let (temp, compiler) = make_script("#!/bin/sh\nsleep 5 &\nexit 0\n");
-        let invocation = SanitizedCommand::direct(compiler, Vec::new(), temp.path().to_path_buf());
+        let (temp, compiler) = executable_fixture("#!/bin/sh\nsleep 5 &\nexit 0\n");
+        let invocation = direct_command(compiler, Vec::new(), temp.path().to_path_buf());
         let started = Instant::now();
 
-        let outcome = run_bounded_capture(
-            &invocation,
-            Duration::from_secs(1),
-            Some(MAX_CAPTURE_BYTES),
-            MAX_CAPTURE_BYTES,
-        );
+        let outcome = capture(&invocation, Duration::from_secs(1));
 
         assert!(matches!(outcome, ProcessOutcome::Exited { success: true, .. }));
         assert!(
@@ -509,14 +558,44 @@ mod tests {
 
     #[test]
     fn reports_an_unavailable_compiler_without_panicking() {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        let (_, status, _) = validate_translation_unit(
-            &command(temp.path()),
-            ClangLanguage::C,
+        let temp = temp_dir();
+        let status = validation_status(
+            temp.path(),
             &temp.path().join("missing-clang"),
             Duration::from_secs(1),
         );
         assert!(matches!(status, ValidationStatus::Unavailable { .. }));
+    }
+
+    #[test]
+    fn compiler_version_probe_reports_stdout_stderr_and_failures() {
+        let assert_probe = |script, expected: &str| {
+            assert_eq!(
+                probe_script(script, Duration::from_secs(1)),
+                Ok(expected.to_string())
+            );
+        };
+        assert_probe("#!/bin/sh\necho 'clang stdout 1'\n", "clang stdout 1");
+        assert_probe("#!/bin/sh\necho 'clang stderr 2' >&2\n", "clang stderr 2");
+
+        let failed = expect_error(probe_script(
+            "#!/bin/sh\necho failed >&2\nexit 9\n",
+            Duration::from_secs(1),
+        ));
+        assert!(failed.contains("Some(9)"));
+
+        let timed_out = expect_error(probe_script(
+            "#!/bin/sh\nexec sleep 2\n",
+            Duration::from_millis(20),
+        ));
+        assert!(timed_out.contains("timed out"));
+
+        let temp = temp_dir();
+        let unavailable = expect_error(probe_compiler_version(
+            &temp.path().join("missing"),
+            Duration::from_secs(1),
+        ));
+        assert!(unavailable.contains("failed to start"));
     }
 
     #[test]
@@ -525,28 +604,28 @@ mod tests {
             return;
         }
 
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let temp = temp_dir();
         let module = temp.path().join("module");
-        fs::create_dir(&module).unwrap_or_else(|error| panic!("create module: {error}"));
-        fs::write(
+        create_dir(&module);
+        write(
             module.join("module.modulemap"),
             "module Danger { header \"danger.h\" export * }\n",
-        )
-        .unwrap_or_else(|error| panic!("write module map: {error}"));
-        fs::write(module.join("danger.h"), "#define DANGER_VALUE 7\n")
-            .unwrap_or_else(|error| panic!("write module header: {error}"));
+        );
+        write(module.join("danger.h"), "#define DANGER_VALUE 7\n");
         let source = temp.path().join("source.c");
-        fs::write(
+        write(
             &source,
             "#include <danger.h>\nint danger(void) { return DANGER_VALUE; }\n",
-        )
-        .unwrap_or_else(|error| panic!("write source: {error}"));
+        );
 
-        let attacker_cache = temp.path().join("attacker-cache");
-        let attacker_output = temp.path().join("attacker.o");
-        let attacker_module = temp.path().join("attacker.pcm");
-        let attacker_crash = temp.path().join("attacker-crash");
-        let attacker_index = temp.path().join("attacker-index");
+        let [attacker_cache, attacker_output, attacker_module, attacker_crash, attacker_index] = [
+            "attacker-cache",
+            "attacker.o",
+            "attacker.pcm",
+            "attacker-crash",
+            "attacker-index",
+        ]
+        .map(|name| temp.path().join(name));
         let arguments = vec![
             "clang".to_string(),
             "-fmodules".to_string(),

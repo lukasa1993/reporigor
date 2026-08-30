@@ -8,7 +8,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use crate::command::{render_stream, run_bounded, CommandLimits};
+use crate::command::{run_bounded, CommandLimits};
+use crate::output::render_stream;
 use crate::CargoOptions;
 
 const REAL_CARGO_ENV: &str = "REPORIGOR_REAL_CARGO";
@@ -38,31 +39,19 @@ impl CargoProxy {
         if extra.is_empty() {
             return Ok(None);
         }
-        let real_cargo = if options.cargo.is_none() {
-            env::var_os(REAL_CARGO_ENV)
-                .map(PathBuf::from)
-                .filter(|path| path.is_file())
-                .map_or_else(|| resolve_program(options.cargo_program()), Ok)?
-        } else {
-            resolve_program(options.cargo_program())?
-        };
+        CargoProxy::build(options, &extra).map(Some)
+    }
+
+    fn build(options: &CargoOptions, extra: &[OsString]) -> io::Result<Self> {
+        let real_cargo = real_cargo(options)?;
         let rustc = find_on_path(OsStr::new("rustc"))?;
         let directory = proxy_directory();
-        build_proxy(&directory, &rustc, &extra)?;
-        let directory = directory.canonicalize().map_err(|error| {
-            remove_proxy_directory(&directory);
-            io::Error::new(
-                error.kind(),
-                format!(
-                    "cannot canonicalize Cargo proxy directory {}: {error}",
-                    directory.display()
-                ),
-            )
-        })?;
-        Ok(Some(Self {
+        build_proxy(&directory, &rustc, extra)?;
+        let directory = canonical_proxy_directory(&directory)?;
+        Ok(Self {
             directory,
             real_cargo,
-        }))
+        })
     }
 
     /// Configures a child command and all of its descendants to use the proxy.
@@ -91,6 +80,29 @@ impl CargoProxy {
     pub fn directory(&self) -> &Path {
         &self.directory
     }
+}
+
+fn real_cargo(options: &CargoOptions) -> io::Result<PathBuf> {
+    if options.cargo.is_some() {
+        return resolve_program(options.cargo_program());
+    }
+    env::var_os(REAL_CARGO_ENV)
+        .map(PathBuf::from)
+        .filter(|path| path.is_file())
+        .map_or_else(|| resolve_program(options.cargo_program()), Ok)
+}
+
+fn canonical_proxy_directory(directory: &Path) -> io::Result<PathBuf> {
+    directory.canonicalize().map_err(|error| {
+        remove_proxy_directory(directory);
+        io::Error::new(
+            error.kind(),
+            format!(
+                "cannot canonicalize Cargo proxy directory {}: {error}",
+                directory.display()
+            ),
+        )
+    })
 }
 
 impl Drop for CargoProxy {
@@ -125,67 +137,89 @@ pub(crate) fn resolve_program(program: &OsStr) -> io::Result<PathBuf> {
 }
 
 fn canonical_executable(candidate: &Path) -> io::Result<PathBuf> {
-    let canonical = candidate.canonicalize().map_err(|error| {
+    let canonical = canonical_executable_path(candidate)?;
+    validate_executable(&canonical)?;
+    rustup_shim_path(candidate, &canonical).map(|path| path.unwrap_or(canonical))
+}
+
+fn canonical_executable_path(candidate: &Path) -> io::Result<PathBuf> {
+    candidate.canonicalize().map_err(|error| {
         io::Error::new(
             error.kind(),
             format!("cannot resolve executable {}: {error}", candidate.display()),
         )
-    })?;
+    })
+}
+
+fn validate_executable(canonical: &Path) -> io::Result<()> {
     if !canonical.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             format!("executable is not a file: {}", canonical.display()),
         ));
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        if canonical
-            .metadata()
-            .map_err(|error| {
-                io::Error::new(
-                    error.kind(),
-                    format!("cannot inspect executable {}: {error}", canonical.display()),
-                )
-            })?
-            .permissions()
-            .mode()
-            & 0o111
-            == 0
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!("file is not executable: {}", canonical.display()),
-            ));
-        }
+    validate_executable_permissions(canonical)
+}
+
+#[cfg(unix)]
+fn validate_executable_permissions(canonical: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mode = canonical
+        .metadata()
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("cannot inspect executable {}: {error}", canonical.display()),
+            )
+        })?
+        .permissions()
+        .mode();
+    if mode & 0o111 == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("file is not executable: {}", canonical.display()),
+        ));
     }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_executable_permissions(_canonical: &Path) -> io::Result<()> {
+    Ok(())
+}
+
+fn rustup_shim_path(candidate: &Path, canonical: &Path) -> io::Result<Option<PathBuf>> {
     // rustup selects `cargo` versus `rustc` from the shim's argv[0]. Calling
     // the fully dereferenced `rustup` path would silently change semantics.
     // Keep that well-known shim name while still canonicalizing its parent,
     // validating its final target above, and returning an absolute path.
     let rustup = executable_name("rustup");
     let rustup_init = executable_name("rustup-init");
-    if canonical
+    let canonical_is_rustup = canonical
         .file_name()
-        .is_some_and(|name| name == OsStr::new(&rustup) || name == OsStr::new(&rustup_init))
-        && matches!(
-            candidate.file_stem().and_then(OsStr::to_str),
-            Some("cargo" | "rustc")
-        )
-    {
-        let parent = candidate.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("executable has no parent directory: {}", candidate.display()),
-            )
-        })?;
-        return Ok(parent.canonicalize()?.join(
-            candidate
-                .file_name()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "executable has no file name"))?,
-        ));
+        .is_some_and(|name| name == OsStr::new(&rustup) || name == OsStr::new(&rustup_init));
+    let requested_is_shim = matches!(
+        candidate.file_stem().and_then(OsStr::to_str),
+        Some("cargo" | "rustc")
+    );
+    if !canonical_is_rustup || !requested_is_shim {
+        return Ok(None);
     }
-    Ok(canonical)
+    preserved_shim_path(candidate).map(Some)
+}
+
+fn preserved_shim_path(candidate: &Path) -> io::Result<PathBuf> {
+    let parent = candidate.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("executable has no parent directory: {}", candidate.display()),
+        )
+    })?;
+    let file_name = candidate
+        .file_name()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "executable has no file name"))?;
+    Ok(parent.canonicalize()?.join(file_name))
 }
 
 fn find_on_search_path(name: &OsStr, path: &OsStr) -> io::Result<PathBuf> {
@@ -291,23 +325,30 @@ where
     F: FnMut(&Path) -> io::Result<()>,
 {
     for attempt in 0..CLEANUP_ATTEMPTS {
-        match remove(directory) {
-            Ok(()) => return,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return,
-            Err(error) if attempt + 1 == CLEANUP_ATTEMPTS => {
-                eprintln!(
-                    "warning: cannot remove Cargo proxy directory {} after {} attempts: {error}",
-                    directory.display(),
-                    CLEANUP_ATTEMPTS
-                );
-                return;
-            }
-            Err(_) => {
-                let delay_ms = 10_u64 << attempt.min(6);
-                thread::sleep(Duration::from_millis(delay_ms));
-            }
+        let Err(error) = remove(directory) else {
+            return;
+        };
+        if cleanup_finished(directory, attempt, &error) {
+            return;
         }
+        let delay_ms = 10_u64 << attempt.min(6);
+        thread::sleep(Duration::from_millis(delay_ms));
     }
+}
+
+fn cleanup_finished(directory: &Path, attempt: usize, error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::NotFound {
+        return true;
+    }
+    if attempt + 1 != CLEANUP_ATTEMPTS {
+        return false;
+    }
+    eprintln!(
+        "warning: cannot remove Cargo proxy directory {} after {} attempts: {error}",
+        directory.display(),
+        CLEANUP_ATTEMPTS
+    );
+    true
 }
 
 fn remove_proxy_directory(directory: &Path) {
@@ -356,18 +397,18 @@ fn build_proxy(directory: &Path, rustc: &Path, extra: &[OsString]) -> io::Result
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::test_support::{executable, temporary_subdirectory};
 
     #[cfg(unix)]
-    fn make_executable(path: &Path) {
-        use std::os::unix::fs::PermissionsExt;
+    fn resolve_test_program(program: &str, search: &OsStr) -> PathBuf {
+        find_on_search_path(OsStr::new(program), search)
+            .unwrap_or_else(|error| panic!("resolve {program}: {error}"))
+    }
 
-        fs::write(path, "#!/bin/sh\nexit 0\n").unwrap_or_else(|error| panic!("write executable: {error}"));
-        let mut permissions = fs::metadata(path)
-            .unwrap_or_else(|error| panic!("executable metadata: {error}"))
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)
-            .unwrap_or_else(|error| panic!("executable permissions: {error}"));
+    #[cfg(unix)]
+    fn test_search_path(paths: impl IntoIterator<Item = PathBuf>) -> OsString {
+        env::join_paths(paths).unwrap_or_else(|error| panic!("search path: {error}"))
     }
 
     #[test]
@@ -403,26 +444,19 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn executable_lookup_ignores_empty_and_relative_path_entries() {
-        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        let absolute_bin = directory.path().join("absolute-bin");
-        fs::create_dir(&absolute_bin).unwrap_or_else(|error| panic!("absolute bin: {error}"));
-        let cargo = absolute_bin.join("cargo");
-        make_executable(&cargo);
-        let rustc = absolute_bin.join("rustc");
-        make_executable(&rustc);
-        let search = env::join_paths([
+        let (_directory, absolute_bin) = temporary_subdirectory("absolute-bin");
+        let cargo = executable(&absolute_bin, "cargo", "#!/bin/sh\nexit 0\n");
+        let rustc = executable(&absolute_bin, "rustc", "#!/bin/sh\nexit 0\n");
+        let search = test_search_path([
             PathBuf::new(),
             PathBuf::from("relative-bin"),
             absolute_bin.clone(),
-        ])
-        .unwrap_or_else(|error| panic!("search path: {error}"));
+        ]);
 
-        let resolved = find_on_search_path(OsStr::new("cargo"), &search)
-            .unwrap_or_else(|error| panic!("resolve cargo: {error}"));
+        let resolved = resolve_test_program("cargo", &search);
         assert_eq!(resolved, cargo.canonicalize().unwrap_or(cargo));
         assert!(resolved.is_absolute());
-        let resolved_rustc = find_on_search_path(OsStr::new("rustc"), &search)
-            .unwrap_or_else(|error| panic!("resolve rustc: {error}"));
+        let resolved_rustc = resolve_test_program("rustc", &search);
         assert_eq!(resolved_rustc, rustc.canonicalize().unwrap_or(rustc));
         assert!(resolved_rustc.is_absolute());
     }
@@ -432,18 +466,13 @@ mod tests {
     fn rustup_init_symlink_preserves_the_requested_tool_name() {
         use std::os::unix::fs::symlink;
 
-        let directory = tempfile::tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        let absolute_bin = directory.path().join("bin");
-        fs::create_dir(&absolute_bin).unwrap_or_else(|error| panic!("absolute bin: {error}"));
-        let dispatcher = absolute_bin.join("rustup-init");
-        make_executable(&dispatcher);
+        let (_directory, absolute_bin) = temporary_subdirectory("bin");
+        let dispatcher = executable(&absolute_bin, "rustup-init", "#!/bin/sh\nexit 0\n");
         let cargo = absolute_bin.join("cargo");
         symlink(&dispatcher, &cargo).unwrap_or_else(|error| panic!("cargo symlink: {error}"));
-        let search =
-            env::join_paths([absolute_bin.clone()]).unwrap_or_else(|error| panic!("search path: {error}"));
+        let search = test_search_path([absolute_bin.clone()]);
 
-        let resolved = find_on_search_path(OsStr::new("cargo"), &search)
-            .unwrap_or_else(|error| panic!("resolve cargo: {error}"));
+        let resolved = resolve_test_program("cargo", &search);
         assert_eq!(
             resolved,
             absolute_bin.canonicalize().unwrap_or(absolute_bin).join("cargo")

@@ -1,5 +1,7 @@
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crate::MutationError;
 
@@ -16,7 +18,9 @@ pub struct CancellationToken {
 impl CancellationToken {
     #[must_use]
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            cancelled: Arc::new(AtomicBool::new(false)),
+        }
     }
 
     /// Request cancellation. Repeated requests are harmless.
@@ -29,6 +33,11 @@ impl CancellationToken {
         self.cancelled.load(Ordering::SeqCst)
     }
 
+    #[cfg(test)]
+    pub(crate) fn shares_state_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.cancelled, &other.cancelled)
+    }
+
     pub(crate) fn check(&self) -> Result<(), MutationError> {
         if self.is_cancelled() {
             Err(MutationError::Cancelled)
@@ -39,16 +48,13 @@ impl CancellationToken {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clones_share_the_cancellation_request() {
-        let token = CancellationToken::new();
-        let clone = token.clone();
-        assert!(!clone.is_cancelled());
-        token.cancel();
-        assert!(clone.is_cancelled());
-        assert!(matches!(clone.check(), Err(MutationError::Cancelled)));
-    }
+#[test]
+fn clones_share_the_cancellation_request() {
+    let token = CancellationToken::new();
+    let clone = token.clone();
+    assert!(!clone.is_cancelled());
+    token.cancel();
+    assert!(clone.is_cancelled());
+    assert!(token.shares_state_with(&clone));
+    assert!(matches!(clone.check(), Err(MutationError::Cancelled)));
 }

@@ -9,7 +9,22 @@ mod ast;
 mod backend;
 mod command;
 mod database;
+#[cfg(test)]
+mod test_support;
 mod validation;
+
+fn word_list_any(list: &str, predicate: impl FnMut(&str) -> bool) -> bool {
+    list.split_ascii_whitespace().any(predicate)
+}
+
+fn word_list_contains(list: &str, candidate: &str) -> bool {
+    word_list_any(list, |word| word == candidate)
+}
+
+#[cfg(test)]
+fn fixture_words(value: &str) -> Vec<&str> {
+    value.split_ascii_whitespace().collect()
+}
 
 pub use ast::{AstDumpStatus, AstTranslationUnit, ClangAnalysis};
 pub use backend::{ClangAdapter, ClangProject};

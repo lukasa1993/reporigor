@@ -1,8 +1,10 @@
-use std::collections::{BTreeMap, BTreeSet};
-use std::env;
-use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env,
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use reporigor_core::{
     AnalysisRequest, BackendCapabilities, BackendInfo, BackendPreference, Capability, CoreError, Diagnostic,
@@ -18,6 +20,21 @@ const SWIFTPM_ID: &str = "swiftpm";
 const PYTHON_ID: &str = "python";
 const BASH_ID: &str = "bash";
 const SHELLCHECK_ID: &str = "shellcheck";
+
+#[derive(Clone, Copy)]
+enum TypeScriptQuery {
+    Configuration,
+    Files,
+}
+
+impl TypeScriptQuery {
+    const fn command(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Configuration => ("--showConfig", "configuration"),
+            Self::Files => ("--listFilesOnly", "file listing"),
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct ProviderOptions {
@@ -52,15 +69,15 @@ pub struct ProviderStatus {
     pub available: bool,
     #[serde(default = "required_for_native_by_default")]
     pub required_for_native: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<PathBuf>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fallback: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hint: Option<String>,
 }
 
@@ -87,7 +104,7 @@ impl ProviderStatus {
 pub struct ProviderProvenance {
     pub id: String,
     pub backend: BackendInfo,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<PathBuf>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<String>,
@@ -203,19 +220,23 @@ impl<R: CommandRunner> ProjectAdapter<R> {
     }
 
     fn preflight_typescript(&self, resolution: &mut ProviderResolution) {
-        let Some(status) = status_by_id(&resolution.inventory, TYPESCRIPT_ID).cloned() else {
+        let Some(executable) = available_provider_executable(resolution, TYPESCRIPT_ID) else {
             return;
         };
-        if !status.applicable || !status.available {
+        if !self.prepare_typescript(resolution, &executable) {
             return;
         }
-        let Some(executable) = status.executable else {
+        let Some(config) = required_typescript_config(resolution) else {
             return;
         };
+        self.resolve_typescript_project(resolution, &executable, &config);
+    }
+
+    fn prepare_typescript(&self, resolution: &mut ProviderResolution, executable: &Path) -> bool {
         let Some(version) = self.run_version(
             resolution,
             TYPESCRIPT_ID,
-            &executable,
+            executable,
             vec![OsString::from("--version")],
         ) else {
             mark_unavailable(
@@ -224,36 +245,22 @@ impl<R: CommandRunner> ProjectAdapter<R> {
                 "the project-local TypeScript compiler failed its version probe",
                 "verify the project's local TypeScript installation and executable permissions",
             );
-            return;
+            return false;
         };
         set_version(resolution, TYPESCRIPT_ID, &version);
-        let major = version
-            .split(|character: char| !character.is_ascii_digit())
-            .find(|part| !part.is_empty())
-            .and_then(|part| part.parse::<u32>().ok());
-        set_metadata(resolution, TYPESCRIPT_ID, "integration_mode", "cli");
-        if major.is_some_and(|major| major >= 7) {
-            resolution.context.diagnostics.push(Diagnostic {
-                severity: Severity::Info,
-                backend: "project-typescript-preflight".to_string(),
-                message: "TypeScript 7 detected; project resolution uses its CLI because no stable programmatic compiler API is exposed".to_string(),
-                location: None,
-                fallback_used: false,
-            });
-        }
+        record_typescript_integration(resolution, &version);
+        true
+    }
 
-        let Some(config) = typescript_config(resolution) else {
-            mark_unavailable(
-                resolution,
-                TYPESCRIPT_ID,
-                "native TypeScript project semantics require tsconfig.json",
-                "add or select a project tsconfig.json, or use the generic backend",
-            );
-            return;
-        };
-        let config_ready = self.preflight_typescript_config(resolution, &executable, &config);
-        let files_ready = self.preflight_typescript_files(resolution, &executable, &config);
-        if !config_ready || !files_ready {
+    fn resolve_typescript_project(
+        &self,
+        resolution: &mut ProviderResolution,
+        executable: &Path,
+        config: &Path,
+    ) {
+        let config_ready = self.preflight_typescript_config(resolution, executable, config);
+        let files_ready = self.preflight_typescript_files(resolution, executable, config);
+        if !both_ready(config_ready, files_ready) {
             mark_unavailable(
                 resolution,
                 TYPESCRIPT_ID,
@@ -263,26 +270,116 @@ impl<R: CommandRunner> ProjectAdapter<R> {
         }
     }
 
+    fn preflight_swift(&self, resolution: &mut ProviderResolution) {
+        let Some(executable) = available_provider_executable(resolution, SWIFTPM_ID) else {
+            return;
+        };
+        let Some(version) = self.preflight_swift_version(resolution, &executable) else {
+            return;
+        };
+        set_version(resolution, SWIFTPM_ID, &version);
+        let Some(output) = self.preflight_swift_description(resolution, executable) else {
+            return;
+        };
+        apply_swift_description(resolution, &output.stdout);
+    }
+
+    fn preflight_swift_version(
+        &self,
+        resolution: &mut ProviderResolution,
+        executable: &Path,
+    ) -> Option<String> {
+        let version = self.run_version(
+            resolution,
+            SWIFTPM_ID,
+            executable,
+            vec![OsString::from("--version")],
+        );
+        if version.is_none() {
+            mark_unavailable(
+                resolution,
+                SWIFTPM_ID,
+                "the configured Swift toolchain failed its version probe",
+                "verify the selected Swift toolchain and executable permissions",
+            );
+        }
+        version
+    }
+
+    fn preflight_swift_description(
+        &self,
+        resolution: &mut ProviderResolution,
+        executable: PathBuf,
+    ) -> Option<ProviderCommandOutput> {
+        let command = ProviderCommand::new(
+            executable,
+            "package --disable-automatic-resolution --skip-update --disable-netrc describe --type json"
+                .split_ascii_whitespace(),
+            resolution.context.root.clone(),
+            self.options.command_timeout,
+        );
+        let result = self.run_recorded(resolution, SWIFTPM_ID, &command);
+        let output = successful_output(resolution, SWIFTPM_ID, "package description", result);
+        if output.is_none() {
+            mark_unavailable(
+                resolution,
+                SWIFTPM_ID,
+                "SwiftPM could not describe the package without dependency resolution or network access",
+                "restore an up-to-date Package.resolved and populate the local SwiftPM dependency cache, then retry",
+            );
+        }
+        output
+    }
+
+    fn preflight_python(&self, resolution: &mut ProviderResolution) {
+        let should_probe = status_by_id(&resolution.inventory, PYTHON_ID)
+            .is_some_and(|status| status.applicable && status.available);
+        if should_probe && !self.preflight_simple_version(resolution, PYTHON_ID) {
+            mark_unavailable(
+                resolution,
+                PYTHON_ID,
+                "the configured Python interpreter failed its version probe",
+                "verify the selected Python interpreter and executable permissions",
+            );
+        }
+    }
+
+    fn preflight_bash(&self, resolution: &mut ProviderResolution) {
+        let _ = self.preflight_simple_version(resolution, BASH_ID);
+    }
+
+    fn preflight_shellcheck(&self, resolution: &mut ProviderResolution) {
+        let Some(executable) = available_provider_executable(resolution, SHELLCHECK_ID) else {
+            return;
+        };
+        let command = ProviderCommand::new(
+            executable,
+            ["--version"],
+            resolution.context.root.clone(),
+            self.options.command_timeout,
+        );
+        let result = self.run_recorded(resolution, SHELLCHECK_ID, &command);
+        let Some(output) = successful_output(resolution, SHELLCHECK_ID, "version probe", result) else {
+            mark_unavailable(
+                resolution,
+                SHELLCHECK_ID,
+                "the configured ShellCheck executable failed its version probe",
+                "verify the configured ShellCheck executable, or leave the optional provider disabled",
+            );
+            return;
+        };
+        record_shellcheck_version(resolution, &output);
+    }
+
     fn preflight_typescript_config(
         &self,
         resolution: &mut ProviderResolution,
         executable: &Path,
         config: &Path,
     ) -> bool {
-        let command = ProviderCommand::new(
-            executable.to_path_buf(),
-            [
-                OsString::from("--showConfig"),
-                OsString::from("-p"),
-                config.as_os_str().to_os_string(),
-                OsString::from("--pretty"),
-                OsString::from("false"),
-            ],
-            resolution.context.root.clone(),
-            self.options.command_timeout,
-        );
-        let result = self.run_recorded(resolution, TYPESCRIPT_ID, &command);
-        let Some(output) = successful_output(resolution, TYPESCRIPT_ID, "configuration", result) else {
+        let Some(output) =
+            self.run_typescript_query(resolution, executable, config, TypeScriptQuery::Configuration)
+        else {
             return false;
         };
         match serde_json::from_str::<serde_json::Value>(&output.stdout) {
@@ -319,181 +416,64 @@ impl<R: CommandRunner> ProjectAdapter<R> {
         executable: &Path,
         config: &Path,
     ) -> bool {
-        let command = ProviderCommand::new(
-            executable.to_path_buf(),
-            [
-                OsString::from("--listFilesOnly"),
-                OsString::from("-p"),
-                config.as_os_str().to_os_string(),
-                OsString::from("--pretty"),
-                OsString::from("false"),
-            ],
-            resolution.context.root.clone(),
+        self.run_typescript_query(resolution, executable, config, TypeScriptQuery::Files)
+            .is_some_and(|output| {
+                let owned = project_owned_typescript_files(&resolution.context.root, &output.stdout);
+                set_metadata(
+                    resolution,
+                    TYPESCRIPT_ID,
+                    "configured_source_count",
+                    &owned.len().to_string(),
+                );
+                if !owned.is_empty() {
+                    resolution.context.sources.retain(|source| {
+                        source.language != Language::TypeScript
+                            || source.path.canonicalize().is_ok_and(|path| owned.contains(&path))
+                    });
+                }
+                true
+            })
+    }
+
+    fn run_typescript_query(
+        &self,
+        resolution: &mut ProviderResolution,
+        executable: &Path,
+        config: &Path,
+        query: TypeScriptQuery,
+    ) -> Option<ProviderCommandOutput> {
+        let (action, phase) = query.command();
+        let command = typescript_project_command(
+            executable,
+            config,
+            &resolution.context.root,
             self.options.command_timeout,
+            action,
         );
         let result = self.run_recorded(resolution, TYPESCRIPT_ID, &command);
-        let Some(output) = successful_output(resolution, TYPESCRIPT_ID, "file listing", result) else {
-            return false;
-        };
-        let owned = project_owned_typescript_files(&resolution.context.root, &output.stdout);
-        set_metadata(
-            resolution,
-            TYPESCRIPT_ID,
-            "configured_source_count",
-            &owned.len().to_string(),
-        );
-        if !owned.is_empty() {
-            resolution.context.sources.retain(|source| {
-                source.language != Language::TypeScript
-                    || source.path.canonicalize().is_ok_and(|path| owned.contains(&path))
-            });
-        }
-        true
-    }
-
-    fn preflight_swift(&self, resolution: &mut ProviderResolution) {
-        let Some(status) = status_by_id(&resolution.inventory, SWIFTPM_ID).cloned() else {
-            return;
-        };
-        if !status.applicable || !status.available {
-            return;
-        }
-        let Some(executable) = status.executable else {
-            return;
-        };
-        let Some(version) = self.run_version(
-            resolution,
-            SWIFTPM_ID,
-            &executable,
-            vec![OsString::from("--version")],
-        ) else {
-            mark_unavailable(
-                resolution,
-                SWIFTPM_ID,
-                "the configured Swift toolchain failed its version probe",
-                "verify the selected Swift toolchain and executable permissions",
-            );
-            return;
-        };
-        set_version(resolution, SWIFTPM_ID, &version);
-        let command = ProviderCommand::new(
-            executable,
-            [
-                "package",
-                "--disable-automatic-resolution",
-                "--skip-update",
-                "--disable-netrc",
-                "describe",
-                "--type",
-                "json",
-            ],
-            resolution.context.root.clone(),
-            self.options.command_timeout,
-        );
-        let output = self.run_recorded(resolution, SWIFTPM_ID, &command);
-        let Some(output) = successful_output(resolution, SWIFTPM_ID, "package description", output) else {
-            mark_unavailable(
-                resolution,
-                SWIFTPM_ID,
-                "SwiftPM could not describe the package without dependency resolution or network access",
-                "restore an up-to-date Package.resolved and populate the local SwiftPM dependency cache, then retry",
-            );
-            return;
-        };
-        match serde_json::from_str::<serde_json::Value>(&output.stdout) {
-            Ok(document) => {
-                for (input, output) in [("name", "package_name"), ("tools_version", "swift_tools_version")] {
-                    if let Some(value) = document.get(input).and_then(serde_json::Value::as_str) {
-                        set_metadata(resolution, SWIFTPM_ID, output, value);
-                    }
-                }
-                if let Some(targets) = document.get("targets").and_then(serde_json::Value::as_array) {
-                    set_metadata(resolution, SWIFTPM_ID, "target_count", &targets.len().to_string());
-                }
-            }
-            Err(error) => {
-                push_probe_diagnostic(
-                    resolution,
-                    SWIFTPM_ID,
-                    Severity::Warning,
-                    format!("swift package describe returned invalid JSON: {error}"),
-                );
-                mark_unavailable(
-                    resolution,
-                    SWIFTPM_ID,
-                    "SwiftPM returned an invalid package description",
-                    "verify that the selected Swift toolchain matches the package",
-                );
-            }
-        }
-    }
-
-    fn preflight_python(&self, resolution: &mut ProviderResolution) {
-        let should_probe = status_by_id(&resolution.inventory, PYTHON_ID)
-            .is_some_and(|status| status.applicable && status.available);
-        if should_probe && !self.preflight_simple_version(resolution, PYTHON_ID) {
-            mark_unavailable(
-                resolution,
-                PYTHON_ID,
-                "the configured Python interpreter failed its version probe",
-                "verify the selected Python interpreter and executable permissions",
-            );
-        }
-    }
-
-    fn preflight_bash(&self, resolution: &mut ProviderResolution) {
-        let _ = self.preflight_simple_version(resolution, BASH_ID);
-    }
-
-    fn preflight_shellcheck(&self, resolution: &mut ProviderResolution) {
-        let Some(status) = status_by_id(&resolution.inventory, SHELLCHECK_ID).cloned() else {
-            return;
-        };
-        if !status.applicable || !status.available {
-            return;
-        }
-        let Some(executable) = status.executable else {
-            return;
-        };
-        let command = ProviderCommand::new(
-            executable,
-            ["--version"],
-            resolution.context.root.clone(),
-            self.options.command_timeout,
-        );
-        let result = self.run_recorded(resolution, SHELLCHECK_ID, &command);
-        if let Some(output) = successful_output(resolution, SHELLCHECK_ID, "version probe", result) {
-            let version = output
-                .stdout
-                .lines()
-                .find_map(|line| line.trim().strip_prefix("version:").map(str::trim))
-                .filter(|line| !line.is_empty())
-                .map_or_else(|| compact_version(&output), str::to_string);
-            if !version.is_empty() {
-                set_version(resolution, SHELLCHECK_ID, &version);
-            }
-        } else {
-            mark_unavailable(
-                resolution,
-                SHELLCHECK_ID,
-                "the configured ShellCheck executable failed its version probe",
-                "verify the configured ShellCheck executable, or leave the optional provider disabled",
-            );
-        }
+        successful_output(resolution, TYPESCRIPT_ID, phase, result)
     }
 
     fn preflight_simple_version(&self, resolution: &mut ProviderResolution, id: &str) -> bool {
         let Some(status) = status_by_id(&resolution.inventory, id).cloned() else {
             return false;
         };
-        if !status.applicable || !status.available {
+        if !provider_can_probe(&status) {
             return false;
         }
-        let Some(executable) = status.executable else {
+        self.run_simple_provider_version(resolution, id, status.executable.as_deref())
+    }
+
+    fn run_simple_provider_version(
+        &self,
+        resolution: &mut ProviderResolution,
+        id: &str,
+        executable: Option<&Path>,
+    ) -> bool {
+        let Some(executable) = executable else {
             return id == BASH_ID;
         };
-        if let Some(version) =
-            self.run_version(resolution, id, &executable, vec![OsString::from("--version")])
+        if let Some(version) = self.run_version(resolution, id, executable, vec![OsString::from("--version")])
         {
             set_version(resolution, id, &version);
             true
@@ -534,17 +514,121 @@ impl<R: CommandRunner> ProjectAdapter<R> {
     }
 }
 
+fn typescript_project_command(
+    executable: &Path,
+    config: &Path,
+    root: &Path,
+    timeout: Duration,
+    action: &str,
+) -> ProviderCommand {
+    ProviderCommand::new(
+        executable.to_path_buf(),
+        [
+            OsString::from(action),
+            OsString::from("-p"),
+            config.as_os_str().to_os_string(),
+            OsString::from("--pretty"),
+            OsString::from("false"),
+        ],
+        root.to_path_buf(),
+        timeout,
+    )
+}
+
+fn available_provider_executable(resolution: &ProviderResolution, id: &str) -> Option<PathBuf> {
+    status_by_id(&resolution.inventory, id)
+        .filter(|status| status.applicable && status.available)
+        .and_then(|status| status.executable.clone())
+}
+
+fn provider_can_probe(status: &ProviderStatus) -> bool {
+    status.applicable && status.available
+}
+
+fn record_typescript_integration(resolution: &mut ProviderResolution, version: &str) {
+    set_metadata(resolution, TYPESCRIPT_ID, "integration_mode", "cli");
+    if typescript_major(version).is_some_and(|major| major >= 7) {
+        resolution.context.diagnostics.push(Diagnostic::new(
+            Severity::Info,
+            "project-typescript-preflight",
+            "TypeScript 7 detected; project resolution uses its CLI because no stable programmatic compiler API is exposed",
+        ));
+    }
+}
+
+fn typescript_major(version: &str) -> Option<u32> {
+    version
+        .split(|character: char| !character.is_ascii_digit())
+        .find(|part| !part.is_empty())
+        .and_then(|part| part.parse().ok())
+}
+
+fn required_typescript_config(resolution: &mut ProviderResolution) -> Option<PathBuf> {
+    let config = typescript_config(resolution);
+    if config.is_none() {
+        mark_unavailable(
+            resolution,
+            TYPESCRIPT_ID,
+            "native TypeScript project semantics require tsconfig.json",
+            "add or select a project tsconfig.json, or use the generic backend",
+        );
+    }
+    config
+}
+
+fn both_ready(first: bool, second: bool) -> bool {
+    [first, second].into_iter().all(std::convert::identity)
+}
+
+fn apply_swift_description(resolution: &mut ProviderResolution, output: &str) {
+    match serde_json::from_str::<serde_json::Value>(output) {
+        Ok(document) => append_swift_metadata(resolution, &document),
+        Err(error) => reject_swift_description(resolution, &error),
+    }
+}
+
+fn append_swift_metadata(resolution: &mut ProviderResolution, document: &serde_json::Value) {
+    for (input, output) in [("name", "package_name"), ("tools_version", "swift_tools_version")] {
+        if let Some(value) = document.get(input).and_then(serde_json::Value::as_str) {
+            set_metadata(resolution, SWIFTPM_ID, output, value);
+        }
+    }
+    if let Some(targets) = document.get("targets").and_then(serde_json::Value::as_array) {
+        set_metadata(resolution, SWIFTPM_ID, "target_count", &targets.len().to_string());
+    }
+}
+
+fn reject_swift_description(resolution: &mut ProviderResolution, error: &serde_json::Error) {
+    push_probe_diagnostic(
+        resolution,
+        SWIFTPM_ID,
+        Severity::Warning,
+        format!("swift package describe returned invalid JSON: {error}"),
+    );
+    mark_unavailable(
+        resolution,
+        SWIFTPM_ID,
+        "SwiftPM returned an invalid package description",
+        "verify that the selected Swift toolchain matches the package",
+    );
+}
+
+fn record_shellcheck_version(resolution: &mut ProviderResolution, output: &ProviderCommandOutput) {
+    let version = output
+        .stdout
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("version:").map(str::trim))
+        .filter(|line| !line.is_empty())
+        .map_or_else(|| compact_version(output), str::to_string);
+    if !version.is_empty() {
+        set_version(resolution, SHELLCHECK_ID, &version);
+    }
+}
+
 impl<R: CommandRunner> ProjectBackend for ProjectAdapter<R> {
     fn info(&self) -> BackendInfo {
-        BackendInfo {
-            id: "project-adapters".to_string(),
-            version: env!("CARGO_PKG_VERSION").to_string(),
-            native: true,
-            capabilities: BackendCapabilities::new([
-                Capability::ProjectSemantics,
-                Capability::ParseValidation,
-            ]),
-        }
+        let capabilities = [Capability::ProjectSemantics, Capability::ParseValidation];
+        BackendInfo::new("project-adapters", env!("CARGO_PKG_VERSION"), true, capabilities)
     }
 
     fn supports(&self, project: ProjectKind) -> bool {
@@ -590,66 +674,11 @@ fn build_inventory(
     let shellcheck = resolve_tool(root, options.shellcheck.as_deref(), &[], &["shellcheck"]);
 
     let mut statuses = vec![
-        make_status(
-            BASH_ID,
-            ProjectKind::Bash,
-            [Capability::ProjectSemantics],
-            has_bash,
-            true,
-            true,
-            bash,
-            Some("tree-sitter"),
-            None,
-            Some("Bash dialect discovery is built in; a Bash executable is only needed for optional validation"),
-        ),
-        make_status(
-            PYTHON_ID,
-            ProjectKind::Python,
-            [Capability::ProjectSemantics],
-            has_python,
-            python.is_some(),
-            true,
-            python,
-            Some("tree-sitter"),
-            Some("no Python interpreter was found in a project virtual environment or PATH"),
-            Some("configure an interpreter path or create/select the project's virtual environment"),
-        ),
-        make_status(
-            SHELLCHECK_ID,
-            ProjectKind::Bash,
-            [],
-            has_bash,
-            shellcheck.is_some(),
-            false,
-            shellcheck,
-            Some("built-in-bash-dialect"),
-            Some("ShellCheck is optional and was not found in PATH"),
-            Some("configure a ShellCheck executable to enable its additional validation"),
-        ),
-        make_status(
-            SWIFTPM_ID,
-            ProjectKind::SwiftPackage,
-            [Capability::ProjectSemantics, Capability::ParseValidation],
-            has_swift,
-            swift.is_some(),
-            true,
-            swift,
-            Some("tree-sitter"),
-            Some("SwiftPM is unavailable because a Swift executable was not found"),
-            Some("configure the Swift executable supplied by the project's selected toolchain"),
-        ),
-        make_status(
-            TYPESCRIPT_ID,
-            ProjectKind::TypeScript,
-            [Capability::ProjectSemantics, Capability::ParseValidation],
-            has_typescript,
-            tsc.is_some(),
-            true,
-            tsc,
-            Some("tree-sitter"),
-            Some("the project has no local TypeScript compiler executable"),
-            Some("restore the project's declared dependencies or configure a local tsc path"),
-        ),
+        inventory_status(ProviderIdentity::Bash, has_bash, bash),
+        inventory_status(ProviderIdentity::Python, has_python, python),
+        inventory_status(ProviderIdentity::Shellcheck, has_bash, shellcheck),
+        inventory_status(ProviderIdentity::SwiftPm, has_swift, swift),
+        inventory_status(ProviderIdentity::TypeScript, has_typescript, tsc),
     ];
     statuses.sort_by(|left, right| left.id.cmp(&right.id));
     statuses
@@ -660,59 +689,187 @@ fn provider_applicability(
     request: &AnalysisRequest,
     metadata: &ProjectMetadata,
 ) -> (bool, bool, bool, bool) {
-    let has_typescript = language_is_selected(request, Language::TypeScript)
-        && (metadata.has_typescript_config
-            || metadata.typescript.contains_key("declared_typescript")
-            || context
-                .sources
-                .iter()
-                .any(|source| source.language == Language::TypeScript));
-    let has_swift =
-        language_is_selected(request, Language::Swift) && context.kinds.contains(&ProjectKind::SwiftPackage);
-    let has_python = language_is_selected(request, Language::Python)
-        && (context.kinds.contains(&ProjectKind::Python)
-            || context
-                .sources
-                .iter()
-                .any(|source| source.language == Language::Python));
-    let has_bash = language_is_selected(request, Language::Bash)
-        && (context.kinds.contains(&ProjectKind::Bash)
-            || context
-                .sources
-                .iter()
-                .any(|source| source.language == Language::Bash));
-    (has_typescript, has_swift, has_python, has_bash)
+    (
+        typescript_is_applicable(context, request, metadata),
+        project_kind_is_selected(context, request, Language::Swift, ProjectKind::SwiftPackage),
+        language_project_is_applicable(context, request, Language::Python, ProjectKind::Python),
+        language_project_is_applicable(context, request, Language::Bash, ProjectKind::Bash),
+    )
+}
+
+fn typescript_is_applicable(
+    context: &ProjectContext,
+    request: &AnalysisRequest,
+    metadata: &ProjectMetadata,
+) -> bool {
+    let project_detected = metadata.has_typescript_config
+        || metadata.typescript.contains_key("declared_typescript")
+        || context_has_language(context, Language::TypeScript);
+    language_is_selected(request, Language::TypeScript) && project_detected
+}
+
+fn project_kind_is_selected(
+    context: &ProjectContext,
+    request: &AnalysisRequest,
+    language: Language,
+    kind: ProjectKind,
+) -> bool {
+    language_is_selected(request, language) && context.kinds.contains(&kind)
+}
+
+fn language_project_is_applicable(
+    context: &ProjectContext,
+    request: &AnalysisRequest,
+    language: Language,
+    kind: ProjectKind,
+) -> bool {
+    let project_detected = context.kinds.contains(&kind) || context_has_language(context, language);
+    language_is_selected(request, language) && project_detected
+}
+
+fn context_has_language(context: &ProjectContext, language: Language) -> bool {
+    context.sources.iter().any(|source| source.language == language)
 }
 
 fn language_is_selected(request: &AnalysisRequest, language: Language) -> bool {
     request.languages.is_empty() || request.languages.contains(&language)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn make_status<const N: usize>(
-    id: &str,
+#[derive(Clone, Copy)]
+enum ProviderIdentity {
+    Bash,
+    Python,
+    Shellcheck,
+    SwiftPm,
+    TypeScript,
+}
+
+struct ProviderStatusSpec<'a> {
+    id: &'a str,
     project: ProjectKind,
-    capabilities: [Capability; N],
+    capabilities: Vec<Capability>,
     applicable: bool,
     available: bool,
     required_for_native: bool,
     executable: Option<PathBuf>,
-    fallback: Option<&str>,
-    missing_reason: Option<&str>,
-    hint: Option<&str>,
+    fallback: Option<&'a str>,
+    missing_reason: Option<&'a str>,
+    hint: Option<&'a str>,
+}
+
+struct ProviderDefinition {
+    id: &'static str,
+    project: ProjectKind,
+    capabilities: &'static [Capability],
+    required_for_native: bool,
+    fallback: &'static str,
+    missing_reason: Option<&'static str>,
+    hint: &'static str,
+}
+
+impl ProviderDefinition {
+    fn parsing_provider(
+        id: &'static str,
+        project: ProjectKind,
+        missing_reason: &'static str,
+        hint: &'static str,
+    ) -> Self {
+        Self {
+            id,
+            project,
+            capabilities: &[Capability::ProjectSemantics, Capability::ParseValidation],
+            required_for_native: true,
+            fallback: "tree-sitter",
+            missing_reason: Some(missing_reason),
+            hint,
+        }
+    }
+}
+
+impl ProviderIdentity {
+    fn definition(self) -> ProviderDefinition {
+        match self {
+            Self::Bash => ProviderDefinition {
+                id: BASH_ID,
+                project: ProjectKind::Bash,
+                capabilities: &[Capability::ProjectSemantics],
+                required_for_native: true,
+                fallback: "tree-sitter",
+                missing_reason: None,
+                hint: "Bash dialect discovery is built in; a Bash executable is only needed for optional validation",
+            },
+            Self::Python => ProviderDefinition {
+                id: PYTHON_ID,
+                project: ProjectKind::Python,
+                capabilities: &[Capability::ProjectSemantics],
+                required_for_native: required_for_native_by_default(),
+                fallback: "tree-sitter",
+                missing_reason: Some("no Python interpreter was found in a project virtual environment or PATH"),
+                hint: "configure an interpreter path or create/select the project's virtual environment",
+            },
+            Self::Shellcheck => ProviderDefinition {
+                id: SHELLCHECK_ID,
+                project: ProjectKind::Bash,
+                capabilities: &[],
+                required_for_native: false,
+                fallback: "built-in-bash-dialect",
+                missing_reason: Some("ShellCheck is optional and was not found in PATH"),
+                hint: "configure a ShellCheck executable to enable its additional validation",
+            },
+            Self::SwiftPm => ProviderDefinition::parsing_provider(
+                SWIFTPM_ID,
+                ProjectKind::SwiftPackage,
+                "SwiftPM is unavailable because a Swift executable was not found",
+                "configure the Swift executable supplied by the project's selected toolchain",
+            ),
+            Self::TypeScript => ProviderDefinition::parsing_provider(
+                TYPESCRIPT_ID,
+                ProjectKind::TypeScript,
+                "the project has no local TypeScript compiler executable",
+                "restore the project's declared dependencies or configure a local tsc path",
+            ),
+        }
+    }
+}
+
+fn inventory_status(
+    identity: ProviderIdentity,
+    applicable: bool,
+    executable: Option<PathBuf>,
 ) -> ProviderStatus {
-    ProviderStatus {
-        id: id.to_string(),
-        project,
-        capabilities: BackendCapabilities::new(capabilities),
+    let available = matches!(identity, ProviderIdentity::Bash) || executable.is_some();
+    let definition = identity.definition();
+    make_status(ProviderStatusSpec {
+        id: definition.id,
+        project: definition.project,
+        capabilities: definition.capabilities.to_vec(),
         applicable,
         available,
-        required_for_native,
+        required_for_native: definition.required_for_native,
         executable,
+        fallback: Some(definition.fallback),
+        missing_reason: definition.missing_reason,
+        hint: Some(definition.hint),
+    })
+}
+
+fn make_status(spec: ProviderStatusSpec<'_>) -> ProviderStatus {
+    ProviderStatus {
+        id: spec.id.to_string(),
+        project: spec.project,
+        capabilities: BackendCapabilities::new(spec.capabilities),
+        applicable: spec.applicable,
+        available: spec.available,
+        required_for_native: spec.required_for_native,
+        executable: spec.executable,
         version: None,
-        fallback: fallback.map(str::to_string),
-        reason: (!available).then(|| missing_reason.unwrap_or("provider is unavailable").to_string()),
-        hint: (!available).then(|| hint.map(str::to_string)).flatten(),
+        fallback: spec.fallback.map(str::to_string),
+        reason: (!spec.available).then(|| {
+            spec.missing_reason
+                .unwrap_or("provider is unavailable")
+                .to_string()
+        }),
+        hint: (!spec.available).then(|| spec.hint.map(str::to_string)).flatten(),
     }
 }
 
@@ -754,37 +911,26 @@ fn unavailable_inventory(reason: &str) -> Vec<ProviderStatus> {
 fn enrich_project_kinds(context: &mut ProjectContext, metadata: &ProjectMetadata) {
     let has_typescript = metadata.has_typescript_config
         || metadata.typescript.contains_key("declared_typescript")
-        || context
-            .sources
-            .iter()
-            .any(|source| source.language == Language::TypeScript);
-    if has_typescript {
-        context.kinds.insert(ProjectKind::TypeScript);
-    } else {
-        context.kinds.remove(&ProjectKind::TypeScript);
-    }
-    let has_python = metadata.has_python_manifest
-        || context
-            .sources
-            .iter()
-            .any(|source| source.language == Language::Python);
-    if has_python {
-        context.kinds.insert(ProjectKind::Python);
-    } else {
-        context.kinds.remove(&ProjectKind::Python);
-    }
-    if metadata.has_swift_manifest {
-        context.kinds.insert(ProjectKind::SwiftPackage);
-    } else {
-        context.kinds.remove(&ProjectKind::SwiftPackage);
-    }
-    if context
-        .sources
-        .iter()
-        .any(|source| source.language == Language::Bash)
-    {
+        || context_has_language(context, Language::TypeScript);
+    let has_python = metadata.has_python_manifest || context_has_language(context, Language::Python);
+    set_project_kind(context, ProjectKind::TypeScript, has_typescript);
+    set_project_kind(context, ProjectKind::Python, has_python);
+    set_project_kind(context, ProjectKind::SwiftPackage, metadata.has_swift_manifest);
+    if context_has_language(context, Language::Bash) {
         context.kinds.insert(ProjectKind::Bash);
     }
+    normalize_generic_project_kind(context);
+}
+
+fn set_project_kind(context: &mut ProjectContext, kind: ProjectKind, present: bool) {
+    if present {
+        context.kinds.insert(kind);
+    } else {
+        context.kinds.remove(&kind);
+    }
+}
+
+fn normalize_generic_project_kind(context: &mut ProjectContext) {
     if context.kinds.len() > 1 {
         context.kinds.remove(&ProjectKind::Generic);
     }
@@ -832,44 +978,78 @@ fn build_provenance(
 }
 
 fn sync_context(resolution: &mut ProviderResolution, preflighted: bool, preference: BackendPreference) {
-    resolution.context.backends = if preflighted {
-        resolution
-            .inventory
-            .iter()
-            .filter(|status| status.applicable && status.available)
-            .filter(|status| status.version.is_some() || status.id == BASH_ID)
-            .map(ProviderStatus::backend_info)
-            .collect()
-    } else {
-        Vec::new()
-    };
+    resolution.context.backends = synchronized_backends(&resolution.inventory, preflighted);
+    resolution.context.diagnostics.retain(retain_project_diagnostic);
+    append_unavailable_provider_diagnostics(resolution, preference);
+    synchronize_provenance(resolution);
+}
 
-    resolution.context.diagnostics.retain(|diagnostic| {
-        !diagnostic.backend.starts_with("project-")
-            || diagnostic.backend.ends_with("-preflight")
-            || diagnostic.backend.ends_with("-discovery")
-    });
+fn synchronized_backends(inventory: &[ProviderStatus], preflighted: bool) -> Vec<BackendInfo> {
+    if !preflighted {
+        return Vec::new();
+    }
+    inventory
+        .iter()
+        .filter(|status| provider_is_preflighted(status))
+        .map(ProviderStatus::backend_info)
+        .collect()
+}
+
+fn provider_is_preflighted(status: &ProviderStatus) -> bool {
+    status.applicable && status.available && (status.version.is_some() || status.id == BASH_ID)
+}
+
+fn retain_project_diagnostic(diagnostic: &Diagnostic) -> bool {
+    !diagnostic.backend.starts_with("project-")
+        || diagnostic.backend.ends_with("-preflight")
+        || diagnostic.backend.ends_with("-discovery")
+}
+
+fn append_unavailable_provider_diagnostics(
+    resolution: &mut ProviderResolution,
+    preference: BackendPreference,
+) {
     for status in &resolution.inventory {
-        if !status.applicable || status.available || matches!(preference, BackendPreference::Generic) {
+        if !provider_requires_diagnostic(status, preference) {
             continue;
         }
-        resolution.context.diagnostics.push(Diagnostic {
-            severity: match (status.id.as_str(), preference) {
-                (SHELLCHECK_ID, _) => Severity::Info,
-                (_, BackendPreference::Native) => Severity::Error,
-                _ => Severity::Warning,
-            },
-            backend: format!("project-{}", status.id),
-            message: status
-                .reason
-                .clone()
-                .unwrap_or_else(|| "provider is unavailable".to_string()),
-            location: None,
-            fallback_used: matches!(preference, BackendPreference::Auto)
-                && status.required_for_native
-                && status.fallback.is_some(),
-        });
+        resolution
+            .context
+            .diagnostics
+            .push(unavailable_provider_diagnostic(status, preference));
     }
+}
+
+fn provider_requires_diagnostic(status: &ProviderStatus, preference: BackendPreference) -> bool {
+    status.applicable && !status.available && !matches!(preference, BackendPreference::Generic)
+}
+
+fn unavailable_provider_diagnostic(status: &ProviderStatus, preference: BackendPreference) -> Diagnostic {
+    Diagnostic {
+        severity: provider_diagnostic_severity(status, preference),
+        backend: format!("project-{}", status.id),
+        message: status
+            .reason
+            .clone()
+            .unwrap_or_else(|| "provider is unavailable".to_string()),
+        location: None,
+        fallback_used: provider_uses_fallback(status, preference),
+    }
+}
+
+fn provider_diagnostic_severity(status: &ProviderStatus, preference: BackendPreference) -> Severity {
+    match (status.id.as_str(), preference) {
+        (SHELLCHECK_ID, _) => Severity::Info,
+        (_, BackendPreference::Native) => Severity::Error,
+        _ => Severity::Warning,
+    }
+}
+
+fn provider_uses_fallback(status: &ProviderStatus, preference: BackendPreference) -> bool {
+    matches!(preference, BackendPreference::Auto) && status.required_for_native && status.fallback.is_some()
+}
+
+fn synchronize_provenance(resolution: &mut ProviderResolution) {
     for provenance in &mut resolution.provenance {
         if let Some(status) = status_by_id(&resolution.inventory, &provenance.id) {
             provenance.backend = status.backend_info();
@@ -907,22 +1087,30 @@ fn resolve_tool(
 }
 
 fn existing_path(root: &Path, path: &Path, require_local: bool) -> Option<PathBuf> {
-    let candidate = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        root.join(path)
-    };
+    let candidate = resolved_candidate(root, path);
     if !is_executable_file(&candidate) {
         return None;
     }
     let canonical_candidate = candidate.canonicalize().ok()?;
-    if require_local {
-        let canonical_root = root.canonicalize().ok()?;
-        if !canonical_candidate.starts_with(canonical_root) {
-            return None;
-        }
+    if !candidate_is_allowed(root, &canonical_candidate, require_local)? {
+        return None;
     }
     Some(canonical_candidate)
+}
+
+fn resolved_candidate(root: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    }
+}
+
+fn candidate_is_allowed(root: &Path, candidate: &Path, require_local: bool) -> Option<bool> {
+    if !require_local {
+        return Some(true);
+    }
+    Some(candidate.starts_with(root.canonicalize().ok()?))
 }
 
 fn find_on_path(name: &str) -> Option<PathBuf> {
@@ -947,21 +1135,7 @@ fn find_on_search_path(name: &str, search_path: &OsStr) -> Option<PathBuf> {
 }
 
 fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = path.metadata() else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
+    reporigor_core::is_executable_file(path)
 }
 
 fn typescript_config(resolution: &ProviderResolution) -> Option<PathBuf> {
@@ -1040,52 +1214,81 @@ fn successful_output(
     result: Result<ProviderCommandOutput, CoreError>,
 ) -> Option<ProviderCommandOutput> {
     match result {
-        Ok(output) if output.output_truncated => {
-            push_probe_diagnostic(
-                resolution,
-                id,
-                Severity::Warning,
-                format!(
-                    "{operation} output exceeded the bounded capture size; refusing to use an incomplete result"
-                ),
-            );
-            None
-        }
-        Ok(output) if output.success() => Some(output),
-        Ok(output) => {
-            let detail = if output.stderr.trim().is_empty() {
-                output.stdout.trim()
-            } else {
-                output.stderr.trim()
-            };
-            push_probe_diagnostic(
-                resolution,
-                id,
-                Severity::Warning,
-                format!(
-                    "{operation} exited with {}{}",
-                    output
-                        .exit_code
-                        .map_or_else(|| "no exit code".to_string(), |code| code.to_string()),
-                    if detail.is_empty() {
-                        String::new()
-                    } else {
-                        format!(": {detail}")
-                    }
-                ),
-            );
-            None
-        }
+        Ok(output) => accepted_provider_output(resolution, id, operation, output),
         Err(error) => {
-            push_probe_diagnostic(
-                resolution,
-                id,
-                Severity::Warning,
-                format!("{operation} failed: {error}"),
-            );
+            reject_provider_error(resolution, id, operation, &error);
             None
         }
     }
+}
+
+fn accepted_provider_output(
+    resolution: &mut ProviderResolution,
+    id: &str,
+    operation: &str,
+    output: ProviderCommandOutput,
+) -> Option<ProviderCommandOutput> {
+    if output.output_truncated {
+        reject_truncated_output(resolution, id, operation);
+        return None;
+    }
+    if output.success() {
+        Some(output)
+    } else {
+        reject_failed_output(resolution, id, operation, &output);
+        None
+    }
+}
+
+fn reject_truncated_output(resolution: &mut ProviderResolution, id: &str, operation: &str) {
+    push_probe_diagnostic(
+        resolution,
+        id,
+        Severity::Warning,
+        format!("{operation} output exceeded the bounded capture size; refusing to use an incomplete result"),
+    );
+}
+
+fn reject_failed_output(
+    resolution: &mut ProviderResolution,
+    id: &str,
+    operation: &str,
+    output: &ProviderCommandOutput,
+) {
+    let exit_code = output
+        .exit_code
+        .map_or_else(|| "no exit code".to_string(), |code| code.to_string());
+    push_probe_diagnostic(
+        resolution,
+        id,
+        Severity::Warning,
+        format!(
+            "{operation} exited with {exit_code}{}",
+            provider_output_detail(output)
+        ),
+    );
+}
+
+fn provider_output_detail(output: &ProviderCommandOutput) -> String {
+    let detail = if output.stderr.trim().is_empty() {
+        output.stdout.trim()
+    } else {
+        output.stderr.trim()
+    };
+    if detail.is_empty() {
+        String::new()
+    } else {
+        format!(": {detail}")
+    }
+}
+
+fn reject_provider_error(resolution: &mut ProviderResolution, id: &str, operation: &str, error: &CoreError) {
+    push_probe_diagnostic(
+        resolution,
+        id,
+        Severity::Warning,
+        format!("{operation} failed: {error}"),
+    );
 }
 
 fn push_probe_diagnostic(resolution: &mut ProviderResolution, id: &str, severity: Severity, message: String) {
@@ -1128,22 +1331,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::*;
-
-    fn make_executable(path: &Path) {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-
-            let mut permissions = fs::metadata(path)
-                .unwrap_or_else(|error| panic!("metadata for {}: {error}", path.display()))
-                .permissions();
-            permissions.set_mode(0o755);
-            fs::set_permissions(path, permissions)
-                .unwrap_or_else(|error| panic!("permissions for {}: {error}", path.display()));
-        }
-        #[cfg(not(unix))]
-        let _ = path;
-    }
+    use crate::test_support::{fixture_executable, make_executable, write_fixtures};
 
     #[derive(Debug, Default)]
     struct PanicRunner {
@@ -1157,30 +1345,128 @@ mod tests {
         }
     }
 
+    fn temporary_project(files: &[(&str, &str)]) -> TempDir {
+        let project = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
+        write_fixtures(project.path(), files);
+        project
+    }
+
+    #[derive(Clone, Copy)]
+    enum MultiLanguageFixture {
+        Inventory,
+        LanguageSelection,
+    }
+
+    fn multi_language_project(fixture: MultiLanguageFixture) -> TempDir {
+        let (pyproject, shell_source) = match fixture {
+            MultiLanguageFixture::Inventory => (
+                "[project]\nname = \"demo\"\nrequires-python = \">=3.11\"\n",
+                "#!/usr/bin/env bash\necho ok\n",
+            ),
+            MultiLanguageFixture::LanguageSelection => (
+                "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
+                "#!/bin/sh\necho ok\n",
+            ),
+        };
+        temporary_project(&[
+            ("tsconfig.json", "{}"),
+            ("pyproject.toml", pyproject),
+            ("Package.swift", "// swift-tools-version: 6.0\n"),
+            ("tool.sh", shell_source),
+            ("app.ts", "export const value = 1;\n"),
+            ("app.py", "value = 1\n"),
+        ])
+    }
+
+    fn discover_without_execution(project: &TempDir) -> (ProjectAdapter<PanicRunner>, ProviderResolution) {
+        let adapter = ProjectAdapter::with_runner(ProviderOptions::default(), PanicRunner::default());
+        let resolution = adapter
+            .discover(&AnalysisRequest::new(project.path().to_path_buf()))
+            .unwrap_or_else(|error| panic!("discover: {error}"));
+        (adapter, resolution)
+    }
+
+    fn assert_no_execution(adapter: &ProjectAdapter<PanicRunner>) {
+        assert_eq!(adapter.runner.calls.load(Ordering::SeqCst), 0);
+    }
+
+    fn canonical_path(path: &Path) -> PathBuf {
+        path.canonicalize()
+            .unwrap_or_else(|error| panic!("canonical {}: {error}", path.display()))
+    }
+
+    fn joined_search_path(paths: impl IntoIterator<Item = PathBuf>) -> OsString {
+        match env::join_paths(paths) {
+            Ok(path) => path,
+            Err(error) => panic!("search path: {error}"),
+        }
+    }
+
+    fn diagnostic_by_backend<'a>(resolution: &'a ProviderResolution, backend: &str) -> &'a Diagnostic {
+        resolution
+            .context
+            .diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.backend == backend)
+            .unwrap_or_else(|| panic!("{backend} diagnostic"))
+    }
+
+    fn typescript_provenance(resolution: &ProviderResolution) -> &ProviderProvenance {
+        resolution
+            .provenance
+            .iter()
+            .find(|provenance| provenance.id == TYPESCRIPT_ID)
+            .unwrap_or_else(|| panic!("TypeScript provenance"))
+    }
+
+    fn assert_typescript_metadata_ignored(
+        resolution: &ProviderResolution,
+        message_fragment: &str,
+        absent_key: &str,
+    ) {
+        let diagnostic = diagnostic_by_backend(resolution, "project-typescript-discovery");
+        assert!(diagnostic.message.contains("package.json"));
+        assert!(diagnostic.message.contains(message_fragment));
+        assert!(!typescript_provenance(resolution)
+            .metadata
+            .contains_key(absent_key));
+    }
+
+    fn assert_unsafe_metadata_is_inert(project: &TempDir, message_fragment: &str, absent_key: &str) {
+        write_fixtures(project.path(), &[("app.ts", "export const value = 1;\n")]);
+        let (adapter, resolution) = discover_without_execution(project);
+        assert_typescript_metadata_ignored(&resolution, message_fragment, absent_key);
+        assert_no_execution(&adapter);
+    }
+
+    fn oversized_package_project() -> TempDir {
+        let project = temporary_project(&[]);
+        let package = project.path().join("package.json");
+        let file = fs::File::create(&package).unwrap_or_else(|error| panic!("package: {error}"));
+        file.set_len(reporigor_core::PROJECT_METADATA_MAX_BYTES + 1)
+            .unwrap_or_else(|error| panic!("sparse length: {error}"));
+        project
+    }
+
+    #[cfg(unix)]
+    fn escaping_package_project() -> (TempDir, TempDir) {
+        use std::os::unix::fs::symlink;
+
+        let project = temporary_project(&[]);
+        let outside = TempDir::new().unwrap_or_else(|error| panic!("outside: {error}"));
+        let target = outside.path().join("package.json");
+        fs::write(&target, r#"{"devDependencies":{"typescript":"5.9.0"}}"#)
+            .unwrap_or_else(|error| panic!("outside package: {error}"));
+        symlink(&target, project.path().join("package.json"))
+            .unwrap_or_else(|error| panic!("symlink: {error}"));
+        (project, outside)
+    }
+
     #[test]
     fn discovery_is_filesystem_only_and_inventory_is_sorted() {
-        let temp = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-        fs::write(temp.path().join("tsconfig.json"), "{}")
-            .unwrap_or_else(|error| panic!("tsconfig: {error}"));
-        fs::write(
-            temp.path().join("pyproject.toml"),
-            "[project]\nname = \"demo\"\nrequires-python = \">=3.11\"\n",
-        )
-        .unwrap_or_else(|error| panic!("pyproject: {error}"));
-        fs::write(temp.path().join("Package.swift"), "// swift-tools-version: 6.0\n")
-            .unwrap_or_else(|error| panic!("manifest: {error}"));
-        fs::write(temp.path().join("tool.sh"), "#!/usr/bin/env bash\necho ok\n")
-            .unwrap_or_else(|error| panic!("bash: {error}"));
-        fs::write(temp.path().join("app.ts"), "export const value = 1;\n")
-            .unwrap_or_else(|error| panic!("typescript: {error}"));
-        fs::write(temp.path().join("app.py"), "value = 1\n")
-            .unwrap_or_else(|error| panic!("python: {error}"));
-
-        let adapter = ProjectAdapter::with_runner(ProviderOptions::default(), PanicRunner::default());
+        let temp = multi_language_project(MultiLanguageFixture::Inventory);
+        let (adapter, resolution) = discover_without_execution(&temp);
         assert!(ProjectBackend::supports(&adapter, ProjectKind::Generic));
-        let resolution = adapter
-            .discover(&AnalysisRequest::new(temp.path().to_path_buf()))
-            .unwrap_or_else(|error| panic!("discover: {error}"));
         let ids = resolution
             .inventory
             .iter()
@@ -1212,121 +1498,46 @@ mod tests {
         assert!(resolution.context.kinds.contains(&ProjectKind::SwiftPackage));
         assert!(resolution.context.kinds.contains(&ProjectKind::TypeScript));
         assert!(resolution.context.backends.is_empty());
-        let resolved = ProjectBackend::resolve(&adapter, &AnalysisRequest::new(temp.path().to_path_buf()))
-            .unwrap_or_else(|error| panic!("trait resolve: {error}"));
+        let resolved = ProjectBackend::resolve(&adapter, &AnalysisRequest::new(temp.path().to_path_buf()));
+        let resolved = resolved.unwrap_or_else(|error| panic!("trait resolve: {error}"));
         assert!(resolved.backends.is_empty());
-        assert_eq!(adapter.runner.calls.load(Ordering::SeqCst), 0);
+        assert_no_execution(&adapter);
     }
 
     #[test]
     fn plain_package_json_does_not_claim_typescript() {
-        let temp = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-        fs::write(temp.path().join("package.json"), r#"{"name":"javascript-only"}"#)
-            .unwrap_or_else(|error| panic!("package: {error}"));
-        fs::write(temp.path().join("index.js"), "export const value = 1;\n")
-            .unwrap_or_else(|error| panic!("source: {error}"));
-        let adapter = ProjectAdapter::with_runner(ProviderOptions::default(), PanicRunner::default());
-        let resolution = adapter
-            .discover(&AnalysisRequest::new(temp.path().to_path_buf()))
-            .unwrap_or_else(|error| panic!("discover: {error}"));
+        let temp = temporary_project(&[
+            ("package.json", r#"{"name":"javascript-only"}"#),
+            ("index.js", "export const value = 1;\n"),
+        ]);
+        let (adapter, resolution) = discover_without_execution(&temp);
         assert!(!resolution.context.kinds.contains(&ProjectKind::TypeScript));
         assert!(resolution.context.kinds.contains(&ProjectKind::Generic));
         let status =
             status_by_id(&resolution.inventory, TYPESCRIPT_ID).unwrap_or_else(|| panic!("typescript status"));
         assert!(!status.applicable);
-        assert_eq!(adapter.runner.calls.load(Ordering::SeqCst), 0);
+        assert_no_execution(&adapter);
     }
 
     #[test]
     fn sparse_oversized_metadata_is_ignored_with_a_warning_and_no_execution() {
-        let temp = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-        let package = temp.path().join("package.json");
-        let file = fs::File::create(&package).unwrap_or_else(|error| panic!("package: {error}"));
-        file.set_len(reporigor_core::PROJECT_METADATA_MAX_BYTES + 1)
-            .unwrap_or_else(|error| panic!("sparse length: {error}"));
-        fs::write(temp.path().join("app.ts"), "export const value = 1;\n")
-            .unwrap_or_else(|error| panic!("source: {error}"));
-
-        let adapter = ProjectAdapter::with_runner(ProviderOptions::default(), PanicRunner::default());
-        let resolution = adapter
-            .discover(&AnalysisRequest::new(temp.path().to_path_buf()))
-            .unwrap_or_else(|error| panic!("discover: {error}"));
-
-        assert!(resolution.context.diagnostics.iter().any(|diagnostic| {
-            diagnostic.backend == "project-typescript-discovery"
-                && diagnostic.message.contains("package.json")
-                && diagnostic.message.contains("maximum")
-        }));
-        let typescript = resolution
-            .provenance
-            .iter()
-            .find(|provenance| provenance.id == TYPESCRIPT_ID)
-            .unwrap_or_else(|| panic!("TypeScript provenance"));
-        assert!(!typescript.metadata.contains_key("package_json"));
-        assert_eq!(adapter.runner.calls.load(Ordering::SeqCst), 0);
+        let temp = oversized_package_project();
+        assert_unsafe_metadata_is_inert(&temp, "maximum", "package_json");
     }
 
     #[cfg(unix)]
     #[test]
     fn escaping_metadata_symlink_is_ignored_with_a_warning_and_no_execution() {
-        use std::os::unix::fs::symlink;
-
-        let temp = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-        let outside = TempDir::new().unwrap_or_else(|error| panic!("outside: {error}"));
-        let target = outside.path().join("package.json");
-        fs::write(&target, r#"{"devDependencies":{"typescript":"5.9.0"}}"#)
-            .unwrap_or_else(|error| panic!("outside package: {error}"));
-        symlink(&target, temp.path().join("package.json")).unwrap_or_else(|error| panic!("symlink: {error}"));
-        fs::write(temp.path().join("app.ts"), "export const value = 1;\n")
-            .unwrap_or_else(|error| panic!("source: {error}"));
-
-        let adapter = ProjectAdapter::with_runner(ProviderOptions::default(), PanicRunner::default());
-        let resolution = adapter
-            .discover(&AnalysisRequest::new(temp.path().to_path_buf()))
-            .unwrap_or_else(|error| panic!("discover: {error}"));
-
-        assert!(resolution.context.diagnostics.iter().any(|diagnostic| {
-            diagnostic.backend == "project-typescript-discovery"
-                && diagnostic.message.contains("package.json")
-                && diagnostic.message.contains("escapes project root")
-        }));
-        let typescript = resolution
-            .provenance
-            .iter()
-            .find(|provenance| provenance.id == TYPESCRIPT_ID)
-            .unwrap_or_else(|| panic!("TypeScript provenance"));
-        assert!(!typescript.metadata.contains_key("declared_typescript"));
-        assert_eq!(adapter.runner.calls.load(Ordering::SeqCst), 0);
+        let (temp, _outside) = escaping_package_project();
+        assert_unsafe_metadata_is_inert(&temp, "escapes project root", "declared_typescript");
     }
 
     #[test]
     fn language_selection_scopes_manifest_derived_provider_applicability() {
-        let temp = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-        fs::write(temp.path().join("tsconfig.json"), "{}")
-            .unwrap_or_else(|error| panic!("tsconfig: {error}"));
-        fs::write(temp.path().join("Package.swift"), "// swift-tools-version: 6.0\n")
-            .unwrap_or_else(|error| panic!("swift manifest: {error}"));
-        fs::write(
-            temp.path().join("pyproject.toml"),
-            "[project]\nname = \"demo\"\nversion = \"0.1.0\"\n",
-        )
-        .unwrap_or_else(|error| panic!("python manifest: {error}"));
-        fs::write(temp.path().join("app.ts"), "export const value = 1;\n")
-            .unwrap_or_else(|error| panic!("typescript: {error}"));
-        fs::write(temp.path().join("app.py"), "value = 1\n")
-            .unwrap_or_else(|error| panic!("python: {error}"));
-        fs::write(temp.path().join("tool.sh"), "#!/bin/sh\necho ok\n")
-            .unwrap_or_else(|error| panic!("Bash: {error}"));
-        fs::write(temp.path().join("app.c"), "int value(void) { return 1; }\n")
-            .unwrap_or_else(|error| panic!("C source: {error}"));
-
-        let configured_bash = temp.path().join("configured-bash");
-        let configured_shellcheck = temp.path().join("configured-shellcheck");
-        for executable in [&configured_bash, &configured_shellcheck] {
-            fs::write(executable, "fixture executable")
-                .unwrap_or_else(|error| panic!("provider executable: {error}"));
-            make_executable(executable);
-        }
+        let temp = multi_language_project(MultiLanguageFixture::LanguageSelection);
+        write_fixtures(temp.path(), &[("app.c", "int value(void) { return 1; }\n")]);
+        let configured_bash = fixture_executable(temp.path(), "configured-bash");
+        let configured_shellcheck = fixture_executable(temp.path(), "configured-shellcheck");
 
         let adapter = ProjectAdapter::with_runner(
             ProviderOptions {
@@ -1367,10 +1578,7 @@ mod tests {
 
     #[test]
     fn provider_diagnostics_respect_backend_preference() {
-        let temp = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-        fs::write(temp.path().join("tsconfig.json"), "{}").unwrap_or_else(|error| panic!("config: {error}"));
-        fs::write(temp.path().join("index.ts"), "export {};\n")
-            .unwrap_or_else(|error| panic!("source: {error}"));
+        let temp = temporary_project(&[("tsconfig.json", "{}"), ("index.ts", "export {};\n")]);
         let adapter = ProjectAdapter::with_runner(ProviderOptions::default(), PanicRunner::default());
 
         let mut generic_request = AnalysisRequest::new(temp.path().to_path_buf());
@@ -1389,12 +1597,7 @@ mod tests {
         let native = adapter
             .discover(&native_request)
             .unwrap_or_else(|error| panic!("native discovery: {error}"));
-        let diagnostic = native
-            .context
-            .diagnostics
-            .iter()
-            .find(|diagnostic| diagnostic.backend == "project-typescript")
-            .unwrap_or_else(|| panic!("native TypeScript diagnostic"));
+        let diagnostic = diagnostic_by_backend(&native, "project-typescript");
         assert_eq!(diagnostic.severity, Severity::Error);
         assert!(!diagnostic.fallback_used);
         assert_eq!(adapter.runner.calls.load(Ordering::SeqCst), 0);
@@ -1402,12 +1605,10 @@ mod tests {
 
     #[test]
     fn configured_typescript_tool_must_stay_inside_project() {
-        let project = TempDir::new().unwrap_or_else(|error| panic!("project: {error}"));
+        let project = temporary_project(&[("tsconfig.json", "{}")]);
         let outside = TempDir::new().unwrap_or_else(|error| panic!("outside: {error}"));
         let outside_tsc = outside.path().join("tsc");
         fs::write(&outside_tsc, "not executable").unwrap_or_else(|error| panic!("tool: {error}"));
-        fs::write(project.path().join("tsconfig.json"), "{}")
-            .unwrap_or_else(|error| panic!("config: {error}"));
         let options = ProviderOptions {
             typescript_tsc: Some(outside_tsc),
             ..ProviderOptions::default()
@@ -1423,23 +1624,17 @@ mod tests {
     #[test]
     fn executable_search_ignores_relative_path_entries_and_returns_canonical_paths() {
         let trusted = TempDir::new().unwrap_or_else(|error| panic!("trusted directory: {error}"));
-        let executable = trusted.path().join("audit-tool");
-        fs::write(&executable, "fixture").unwrap_or_else(|error| panic!("tool: {error}"));
-        make_executable(&executable);
-        let expected = executable
-            .canonicalize()
-            .unwrap_or_else(|error| panic!("canonical tool: {error}"));
+        let executable = fixture_executable(trusted.path(), "audit-tool");
+        let expected = canonical_path(&executable);
 
-        let trusted_search = env::join_paths([
+        let trusted_search = joined_search_path([
             PathBuf::new(),
             PathBuf::from("relative-bin"),
             trusted.path().to_path_buf(),
-        ])
-        .unwrap_or_else(|error| panic!("search path: {error}"));
+        ]);
         assert_eq!(find_on_search_path("audit-tool", &trusted_search), Some(expected));
 
-        let untrusted_search = env::join_paths([PathBuf::new(), PathBuf::from("relative-bin")])
-            .unwrap_or_else(|error| panic!("untrusted search path: {error}"));
+        let untrusted_search = joined_search_path([PathBuf::new(), PathBuf::from("relative-bin")]);
         assert_eq!(find_on_search_path("audit-tool", &untrusted_search), None);
     }
 
@@ -1448,24 +1643,17 @@ mod tests {
     fn executable_resolution_rejects_files_without_execute_permission() {
         use std::os::unix::fs::PermissionsExt;
 
-        let project = TempDir::new().unwrap_or_else(|error| panic!("project: {error}"));
+        let project = temporary_project(&[("configured-python", "fixture")]);
         let executable = project.path().join("configured-python");
-        fs::write(&executable, "fixture").unwrap_or_else(|error| panic!("tool: {error}"));
-        let mut permissions = fs::metadata(&executable)
-            .unwrap_or_else(|error| panic!("metadata: {error}"))
-            .permissions();
-        permissions.set_mode(0o644);
-        fs::set_permissions(&executable, permissions).unwrap_or_else(|error| panic!("permissions: {error}"));
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644))
+            .unwrap_or_else(|error| panic!("permissions: {error}"));
 
         assert_eq!(existing_path(project.path(), &executable, false), None);
-        let search_path =
-            env::join_paths([project.path()]).unwrap_or_else(|error| panic!("search path: {error}"));
+        let search_path = joined_search_path([project.path().to_path_buf()]);
         assert_eq!(find_on_search_path("configured-python", &search_path), None);
 
         make_executable(&executable);
-        let expected = executable
-            .canonicalize()
-            .unwrap_or_else(|error| panic!("canonical tool: {error}"));
+        let expected = canonical_path(&executable);
         assert_eq!(
             existing_path(project.path(), &executable, false),
             Some(expected.clone())

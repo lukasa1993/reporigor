@@ -1,6 +1,9 @@
-export function secondaryChoice(left: number, right: number): number {
-  if (left > 0 && right !== 0) {
-    return left + right;
+export function secondaryChoice(first: number, second: number): number {
+  let result = first + second;
+  const threshold = 25;
+  result = result * 3;
+  if (first > 1 && second !== 2) {
+    result = result + threshold;
   }
-  return 0;
+  return result;
 }

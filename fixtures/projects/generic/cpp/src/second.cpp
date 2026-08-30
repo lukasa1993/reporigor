@@ -1,9 +1,12 @@
 class SecondaryChoice {
 public:
-  int choose(int left, int right) const {
-    if (left > 0 && right != 0) {
-      return left + right;
+  int choose(int first, int second) const {
+    int result = first + second;
+    int threshold = 25;
+    result = result * 3;
+    if (first > 1 && second != 2) {
+      result = result + threshold;
     }
-    return 0;
+    return result;
   }
 };

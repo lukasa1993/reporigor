@@ -291,9 +291,13 @@ reporigor check . \
   --test-command "cargo test --workspace"
 ```
 
-`check` exits 2 for any CRAP score over the limit, any retained duplicate
-group, or disallowed surviving mutant. A mutation infrastructure/error state
-takes precedence and exits 1.
+`check` emits the legacy CRAP, DRY, and mutation sections plus the integrated
+deterministic rule stream. With rule-baseline mode disabled it exits 2 for any
+failed rule. With complete evidence and baseline mode enabled it exits 2 for
+new or worsened violations; existing and improved debt remains visible. In
+either mode, any nonempty integrated omission list makes the baseline gate
+false and exits 2. A mutation infrastructure/error state takes precedence and
+exits 1.
 
 ## Backend selection during migration
 

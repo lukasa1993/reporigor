@@ -1,9 +1,13 @@
 #!/usr/bin/env bash
 
 primary_choice() {
-  if [[ "$1" == yes && "$2" != no ]]; then
-    printf '%s\n' enabled
+  total=$(("$1" + "$2"))
+  limit=10
+  total=$((total * 2))
+  if [[ "$1" -gt 0 && "$2" -ne 0 ]]; then
+    total=$((total + limit))
   else
-    printf '%s\n' disabled
+    total=$((total - limit))
   fi
+  printf '%s\n' "$total"
 }

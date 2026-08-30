@@ -9,8 +9,9 @@ use reporigor_core::{Language, MutationResult};
 use serde::{Deserialize, Serialize};
 
 /// Mutation engine selected at the provider boundary.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[repr(usize)]
 pub enum MutationProvider {
     BuiltIn,
     CargoMutants,
@@ -19,6 +20,24 @@ pub enum MutationProvider {
     Mull,
     Muter,
 }
+
+const PROVIDER_NAMES: [&str; MutationProvider::ALL.len()] =
+    ["built-in", "cargo-mutants", "mutmut", "stryker", "mull", "muter"];
+
+const PROVIDER_ALIASES: [(&str, MutationProvider); 12] = [
+    ("built-in", MutationProvider::BuiltIn),
+    ("builtin", MutationProvider::BuiltIn),
+    ("reporigor", MutationProvider::BuiltIn),
+    ("cargo-mutants", MutationProvider::CargoMutants),
+    ("cargomutants", MutationProvider::CargoMutants),
+    ("mutmut", MutationProvider::Mutmut),
+    ("stryker", MutationProvider::Stryker),
+    ("strykerjs", MutationProvider::Stryker),
+    ("stryker-js", MutationProvider::Stryker),
+    ("mull", MutationProvider::Mull),
+    ("mull-runner", MutationProvider::Mull),
+    ("muter", MutationProvider::Muter),
+];
 
 impl MutationProvider {
     pub const ALL: [Self; 6] = [
@@ -32,14 +51,7 @@ impl MutationProvider {
 
     #[must_use]
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::BuiltIn => "built-in",
-            Self::CargoMutants => "cargo-mutants",
-            Self::Mutmut => "mutmut",
-            Self::Stryker => "stryker",
-            Self::Mull => "mull",
-            Self::Muter => "muter",
-        }
+        PROVIDER_NAMES[self as usize]
     }
 
     #[must_use]
@@ -69,7 +81,7 @@ impl MutationProvider {
 
 impl fmt::Display for MutationProvider {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
+        self.as_str().fmt(formatter)
     }
 }
 
@@ -77,21 +89,19 @@ impl FromStr for MutationProvider {
     type Err = String;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value.trim().to_ascii_lowercase().replace('_', "-").as_str() {
-            "built-in" | "builtin" | "reporigor" => Ok(Self::BuiltIn),
-            "cargo-mutants" | "cargomutants" => Ok(Self::CargoMutants),
-            "mutmut" => Ok(Self::Mutmut),
-            "stryker" | "strykerjs" | "stryker-js" => Ok(Self::Stryker),
-            "mull" | "mull-runner" => Ok(Self::Mull),
-            "muter" => Ok(Self::Muter),
-            _ => Err(format!("unsupported mutation provider: {value}")),
-        }
+        let normalized = value.trim().to_ascii_lowercase().replace('_', "-");
+        PROVIDER_ALIASES
+            .iter()
+            .find(|(alias, _)| *alias == normalized)
+            .map(|(_, provider)| *provider)
+            .ok_or_else(|| format!("unsupported mutation provider: {value}"))
     }
 }
 
 /// How an executable was resolved. Static discovery never executes it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
+#[repr(u8)]
 pub enum DetectionSource {
     BuiltIn,
     ExplicitOverride,
@@ -100,7 +110,7 @@ pub enum DetectionSource {
 }
 
 /// Report format accepted by an optional provider importer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum ImportFormat {
     MutationTestingElementsV1,
@@ -110,7 +120,7 @@ pub enum ImportFormat {
 }
 
 /// Side-effect classification attached to every provider command.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum CommandEffect {
     ReadOnlyProbe,
@@ -193,6 +203,23 @@ impl Default for MutationProviderOptions {
             probe_timeout: Duration::from_secs(5),
             output_limit_bytes: 256 * 1024,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_names_and_aliases_round_trip() {
+        for provider in MutationProvider::ALL {
+            assert_eq!(provider.as_str().parse(), Ok(provider));
+        }
+        assert_eq!("reporigor".parse(), Ok(MutationProvider::BuiltIn));
+        assert_eq!("cargo_mutants".parse(), Ok(MutationProvider::CargoMutants));
+        assert_eq!("stryker-js".parse(), Ok(MutationProvider::Stryker));
+        assert_eq!("mull-runner".parse(), Ok(MutationProvider::Mull));
+        assert!(MutationProvider::from_str("unknown").is_err());
     }
 }
 

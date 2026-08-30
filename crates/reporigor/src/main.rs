@@ -1,9 +1,7 @@
-use std::io::{self, Write};
 use std::process::ExitCode;
 
 use clap::Parser;
-use reporigor::{install_signal_handlers, legacy_entry_from_env, run, Cli};
-use reporigor_reporting::escape_terminal_text;
+use reporigor::{install_signal_handlers, legacy_entry_from_env, run, write_terminal_error, Cli};
 
 fn main() -> ExitCode {
     if let Err(error) = install_signal_handlers() {
@@ -25,5 +23,5 @@ fn main() -> ExitCode {
 }
 
 fn write_error(message: &str) {
-    let _result = writeln!(io::stderr().lock(), "{}", escape_terminal_text(message));
+    write_terminal_error(message);
 }

@@ -4,6 +4,16 @@ version = "0.0.0"
 edition = "2021"
 publish = false
 
+[dependencies]
+renamed_dep = { package = "fixture-dependency", path = "dependency", optional = true }
+
+[features]
+default = ["composed", "dependency-mode"]
+composed = ["child"]
+child = []
+dependency-mode = ["dep:renamed_dep"]
+unused = []
+
 [lib]
 path = "src/lib.rs"
 

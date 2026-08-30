@@ -1,6 +1,7 @@
 use std::fmt;
 use std::fs::{self, File};
 use std::io::Read;
+use std::marker::PhantomData;
 use std::path::{Component, Path, PathBuf};
 
 use reporigor_core::Language;
@@ -19,6 +20,8 @@ const MAX_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_ARGUMENT_BYTES: usize = 64 * 1024;
 const MAX_ARGUMENT_BYTES_PER_ENTRY: usize = 1024 * 1024;
 const MAX_PATH_FIELD_BYTES: usize = 64 * 1024;
+const LANGUAGE_EXTENSIONS: &str =
+    "c,i=c;C,cc,cp,cpp,cxx,c++,ii,CPP,CXX=c++;m,mi=objective-c;mm,mii,M=objective-c++";
 
 /// Errors raised while discovering or parsing an existing compilation
 /// database. Discovery never attempts to generate one.
@@ -26,14 +29,15 @@ const MAX_PATH_FIELD_BYTES: usize = 64 * 1024;
 pub enum ClangAdapterError {
     #[error("project path {path} does not exist or is not a directory")]
     InvalidRoot { path: String },
-    #[error("failed to read {path}: {source}")]
+    #[error("failed to {operation} {path}: {source}")]
     Read {
-        path: String,
+        operation: &'static str,
         #[source]
         source: std::io::Error,
+        path: String,
     },
     #[error("failed to parse {path}: {message}")]
-    Parse { path: String, message: String },
+    Parse { message: String, path: String },
     #[error("invalid entry {index} in {path}: {message}")]
     InvalidEntry {
         path: String,
@@ -69,15 +73,17 @@ pub struct CompileCommand {
     pub file: PathBuf,
     /// Parsed argv including the database's original executable/wrappers.
     pub arguments: Vec<String>,
-    /// Optional producer-described output path.
-    pub output: Option<String>,
     /// Exact original command representation.
     pub origin: CommandOrigin,
+    /// Optional producer-described output path.
+    pub output: Option<String>,
 }
 
-/// An existing parsed JSON compilation database.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[doc = "An existing parsed JSON compilation database."]
+#[must_use = "use the commands loaded from the compilation database"]
 pub struct CompilationDatabase {
+    /// Canonical path of the loaded compilation database.
     pub path: PathBuf,
     pub commands: Vec<CompileCommand>,
 }
@@ -140,94 +146,181 @@ struct RawCompileCommand {
 #[derive(Debug)]
 struct LimitedArguments(Vec<String>);
 
-impl<'de> Deserialize<'de> for LimitedArguments {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct LimitedArgumentsVisitor;
+struct RawCompileCommands(Vec<RawCompileCommand>);
 
-        impl<'de> Visitor<'de> for LimitedArgumentsVisitor {
-            type Value = LimitedArguments;
+trait BoundedSequence: Sized {
+    type Item;
+    type State: Default;
 
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("a bounded compilation argument array")
-            }
+    const DESCRIPTION: &'static str;
+    const MAXIMUM: usize;
 
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
-            where
-                A: SeqAccess<'de>,
-            {
-                let mut arguments = Vec::with_capacity(
-                    sequence
-                        .size_hint()
-                        .unwrap_or_default()
-                        .min(MAX_ARGUMENTS_PER_ENTRY),
-                );
-                let mut total_bytes = 0_usize;
-                while let Some(argument) = sequence.next_element::<String>()? {
-                    if arguments.len() == MAX_ARGUMENTS_PER_ENTRY {
-                        return Err(de::Error::custom(format_args!(
-                            "argv exceeds the {MAX_ARGUMENTS_PER_ENTRY}-argument limit"
-                        )));
-                    }
-                    if argument.len() > MAX_ARGUMENT_BYTES {
-                        return Err(de::Error::custom(format_args!(
-                            "argument exceeds the {MAX_ARGUMENT_BYTES}-byte token limit"
-                        )));
-                    }
-                    total_bytes += argument.len();
-                    if total_bytes > MAX_ARGUMENT_BYTES_PER_ENTRY {
-                        return Err(de::Error::custom(format_args!(
-                            "argv exceeds the {MAX_ARGUMENT_BYTES_PER_ENTRY}-byte aggregate limit"
-                        )));
-                    }
-                    arguments.push(argument);
-                }
-                Ok(LimitedArguments(arguments))
-            }
-        }
+    fn limit_message() -> String;
+    fn validate(value: &Self::Item, state: &mut Self::State) -> Result<(), String>;
+    fn from_values(values: Vec<Self::Item>) -> Self;
+}
 
-        deserializer.deserialize_seq(LimitedArgumentsVisitor)
+impl BoundedSequence for LimitedArguments {
+    type Item = String;
+    type State = usize;
+
+    const DESCRIPTION: &'static str = "a bounded compilation argument array";
+    const MAXIMUM: usize = MAX_ARGUMENTS_PER_ENTRY;
+
+    fn limit_message() -> String {
+        format!("argv exceeds the {MAX_ARGUMENTS_PER_ENTRY}-argument limit")
+    }
+
+    fn validate(argument: &String, total_bytes: &mut usize) -> Result<(), String> {
+        validate_deserialized_argument(argument, total_bytes)
+    }
+
+    fn from_values(values: Vec<String>) -> Self {
+        Self(values)
     }
 }
 
-struct RawCompileCommands(Vec<RawCompileCommand>);
+impl BoundedSequence for RawCompileCommands {
+    type State = ();
+    type Item = RawCompileCommand;
 
-impl<'de> Deserialize<'de> for RawCompileCommands {
-    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
-    where
-        D: Deserializer<'de>,
-    {
-        struct RawCompileCommandsVisitor;
+    const MAXIMUM: usize = MAX_DATABASE_ENTRIES;
+    const DESCRIPTION: &'static str = "an array of compilation database entries";
 
-        impl<'de> Visitor<'de> for RawCompileCommandsVisitor {
-            type Value = RawCompileCommands;
+    fn limit_message() -> String {
+        format!("compilation database exceeds the {MAX_DATABASE_ENTRIES}-entry limit")
+    }
 
-            fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-                formatter.write_str("an array of compilation database entries")
-            }
+    fn from_values(values: Vec<RawCompileCommand>) -> Self {
+        Self(values)
+    }
 
-            fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+    fn validate(_: &RawCompileCommand, (): &mut ()) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+macro_rules! impl_bounded_sequence_deserialize {
+    ($wrapper:ty) => {
+        impl<'de> Deserialize<'de> for $wrapper {
+            fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
             where
-                A: SeqAccess<'de>,
+                D: serde::Deserializer<'de>,
             {
-                let mut commands =
-                    Vec::with_capacity(sequence.size_hint().unwrap_or_default().min(MAX_DATABASE_ENTRIES));
-                while let Some(command) = sequence.next_element()? {
-                    if commands.len() == MAX_DATABASE_ENTRIES {
-                        return Err(de::Error::custom(format_args!(
-                            "compilation database exceeds the {MAX_DATABASE_ENTRIES}-entry limit"
-                        )));
-                    }
-                    commands.push(command);
-                }
-                Ok(RawCompileCommands(commands))
+                deserialize_bounded_wrapper(deserializer)
             }
         }
+    };
+}
 
-        deserializer.deserialize_seq(RawCompileCommandsVisitor)
+impl_bounded_sequence_deserialize!(LimitedArguments);
+impl_bounded_sequence_deserialize!(RawCompileCommands);
+
+fn deserialize_bounded_wrapper<'de, D, W>(deserializer: D) -> Result<W, D::Error>
+where
+    D: Deserializer<'de>,
+    W: BoundedSequence,
+    W::Item: Deserialize<'de>,
+{
+    let mut state = W::State::default();
+    deserialize_bounded_sequence(
+        deserializer,
+        W::DESCRIPTION,
+        W::MAXIMUM,
+        W::limit_message(),
+        |value| W::validate(value, &mut state),
+    )
+    .map(W::from_values)
+}
+
+struct BoundedSequenceVisitor<T, F> {
+    description: &'static str,
+    maximum: usize,
+    limit_message: String,
+    validate: F,
+    marker: PhantomData<T>,
+}
+
+impl<'de, T, F> Visitor<'de> for BoundedSequenceVisitor<T, F>
+where
+    T: Deserialize<'de>,
+    F: FnMut(&T) -> Result<(), String>,
+{
+    type Value = Vec<T>;
+
+    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(self.description)
     }
+
+    fn visit_seq<A>(mut self, mut sequence: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        collect_bounded_sequence(
+            &mut sequence,
+            self.maximum,
+            self.limit_message,
+            &mut self.validate,
+        )
+    }
+}
+
+fn deserialize_bounded_sequence<'de, D, T, F>(
+    deserializer: D,
+    description: &'static str,
+    maximum: usize,
+    limit_message: String,
+    validate: F,
+) -> Result<Vec<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+    F: FnMut(&T) -> Result<(), String>,
+{
+    deserializer.deserialize_seq(BoundedSequenceVisitor {
+        description,
+        maximum,
+        limit_message,
+        validate,
+        marker: PhantomData,
+    })
+}
+
+fn collect_bounded_sequence<
+    'de,
+    T: Deserialize<'de>,
+    F: FnMut(&T) -> Result<(), String>,
+    A: SeqAccess<'de>,
+>(
+    sequence: &mut A,
+    maximum: usize,
+    limit_message: String,
+    mut validate: F,
+) -> Result<Vec<T>, A::Error> {
+    let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or_default().min(maximum));
+    while let Some(value) = sequence.next_element()? {
+        if values.len() == maximum {
+            return Err(de::Error::custom(limit_message));
+        }
+        validate(&value).map_err(de::Error::custom)?;
+        values.push(value);
+    }
+    Ok(values)
+}
+
+fn validate_deserialized_argument(argument: &str, total_bytes: &mut usize) -> Result<(), String> {
+    if argument.len() > MAX_ARGUMENT_BYTES {
+        return Err(format!(
+            "argument exceeds the {MAX_ARGUMENT_BYTES}-byte token limit"
+        ));
+    }
+    *total_bytes = total_bytes.saturating_add(argument.len());
+    if *total_bytes > MAX_ARGUMENT_BYTES_PER_ENTRY {
+        return Err(format!(
+            "argv exceeds the {MAX_ARGUMENT_BYTES_PER_ENTRY}-byte aggregate limit"
+        ));
+    }
+    Ok(())
 }
 
 /// Locate an already-generated compilation database. Root-level databases take
@@ -240,25 +333,41 @@ impl<'de> Deserialize<'de> for RawCompileCommands {
 /// Returns an error when `root` is invalid or its directory entries cannot be
 /// inspected.
 pub fn discover_compilation_database(root: &Path) -> Result<Option<PathBuf>, ClangAdapterError> {
-    let root_metadata = fs::metadata(root).map_err(|_| ClangAdapterError::InvalidRoot {
-        path: root.display().to_string(),
-    })?;
+    let canonical_root = match discovery_root(root)? {
+        DiscoveryRoot::Database(path) => return Ok(Some(path)),
+        DiscoveryRoot::Directory(path) => path,
+    };
+    if let Some(candidate) = conventional_candidate(&canonical_root)? {
+        return Ok(Some(candidate));
+    }
+    child_candidate(&canonical_root)
+}
+
+enum DiscoveryRoot {
+    Database(PathBuf),
+    Directory(PathBuf),
+}
+
+fn discovery_root(root: &Path) -> Result<DiscoveryRoot, ClangAdapterError> {
+    let root_metadata = fs::metadata(root).map_err(|_| invalid_root(root))?;
     if root_metadata.is_file() {
-        return if root.file_name().is_some_and(|name| name == DATABASE_NAME) {
-            canonical_regular_file(root).map(Some)
-        } else {
-            Err(ClangAdapterError::InvalidRoot {
-                path: root.display().to_string(),
-            })
-        };
+        return database_root(root);
     }
     if !root_metadata.is_dir() {
-        return Err(ClangAdapterError::InvalidRoot {
-            path: root.display().to_string(),
-        });
+        return Err(invalid_root(root));
     }
-    let canonical_root = canonical_directory(root)?;
+    canonical_directory(root).map(DiscoveryRoot::Directory)
+}
 
+fn database_root(root: &Path) -> Result<DiscoveryRoot, ClangAdapterError> {
+    if root.file_name().is_some_and(|name| name == DATABASE_NAME) {
+        canonical_regular_file(root).map(DiscoveryRoot::Database)
+    } else {
+        Err(invalid_root(root))
+    }
+}
+
+fn conventional_candidate(canonical_root: &Path) -> Result<Option<PathBuf>, ClangAdapterError> {
     for relative in [
         DATABASE_NAME,
         "build/compile_commands.json",
@@ -266,103 +375,114 @@ pub fn discover_compilation_database(root: &Path) -> Result<Option<PathBuf>, Cla
         "out/compile_commands.json",
     ] {
         let candidate = canonical_root.join(relative);
-        if let Some(candidate) = automatic_candidate(&candidate, &canonical_root)? {
+        if let Some(candidate) = automatic_candidate(&candidate, canonical_root)? {
             return Ok(Some(candidate));
         }
     }
+    Ok(None)
+}
 
+fn child_candidate(canonical_root: &Path) -> Result<Option<PathBuf>, ClangAdapterError> {
     let mut child_candidates = Vec::new();
-    for (index, entry) in fs::read_dir(&canonical_root)
-        .map_err(|source| ClangAdapterError::Read {
-            path: canonical_root.display().to_string(),
-            source,
-        })?
-        .enumerate()
-    {
-        if index == MAX_DISCOVERY_ENTRIES {
-            return Err(invalid_data_error(
-                &canonical_root,
-                format!("directory exceeds the {MAX_DISCOVERY_ENTRIES}-entry discovery limit"),
-            ));
-        }
-        let entry = entry.map_err(|source| ClangAdapterError::Read {
-            path: canonical_root.display().to_string(),
-            source,
-        })?;
-        if entry
-            .file_type()
-            .map_err(|source| ClangAdapterError::Read {
-                path: entry.path().display().to_string(),
-                source,
-            })?
-            .is_dir()
-        {
-            let candidate = entry.path().join(DATABASE_NAME);
-            if let Some(candidate) = automatic_candidate(&candidate, &canonical_root)? {
-                child_candidates.push(candidate);
-            }
+    let entries = child_entries(canonical_root)?;
+    for (index, entry) in entries.enumerate() {
+        if let Some(candidate) = inspect_child_entry(canonical_root, index, entry)? {
+            child_candidates.push(candidate);
         }
     }
     child_candidates.sort();
     Ok(child_candidates.into_iter().next())
 }
 
+fn child_entries(root: &Path) -> Result<fs::ReadDir, ClangAdapterError> {
+    fs::read_dir(root).map_err(|source| read_error(root, source))
+}
+
+fn inspect_child_entry(
+    canonical_root: &Path,
+    index: usize,
+    entry: Result<fs::DirEntry, std::io::Error>,
+) -> Result<Option<PathBuf>, ClangAdapterError> {
+    if index == MAX_DISCOVERY_ENTRIES {
+        return Err(invalid_data_error(
+            canonical_root,
+            format!("directory exceeds the {MAX_DISCOVERY_ENTRIES}-entry discovery limit"),
+        ));
+    }
+    let entry = entry.map_err(|source| read_error(canonical_root, source))?;
+    let file_type = entry
+        .file_type()
+        .map_err(|source| read_error(&entry.path(), source))?;
+    if !file_type.is_dir() {
+        return Ok(None);
+    }
+    automatic_candidate(&entry.path().join(DATABASE_NAME), canonical_root)
+}
+
 fn canonical_file(path: &Path) -> Result<PathBuf, ClangAdapterError> {
-    path.canonicalize().map_err(|source| ClangAdapterError::Read {
-        path: path.display().to_string(),
-        source,
-    })
+    io_at_path(path, path.canonicalize())
 }
 
 fn canonical_regular_file(path: &Path) -> Result<PathBuf, ClangAdapterError> {
-    let link_metadata = fs::symlink_metadata(path).map_err(|source| ClangAdapterError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    if link_metadata.file_type().is_symlink() {
+    validate_regular_database_path(path)?;
+    let canonical = canonical_file(path)?;
+    let metadata = path_metadata(&canonical, |candidate| fs::metadata(candidate))?;
+    ensure_regular(&canonical, &metadata)?;
+    Ok(canonical)
+}
+
+fn validate_regular_database_path(path: &Path) -> Result<(), ClangAdapterError> {
+    let metadata = path_metadata(path, |candidate| fs::symlink_metadata(candidate))?;
+    if metadata.file_type().is_symlink() {
         return Err(invalid_data_error(
             path,
             "symbolic links are not accepted for compilation databases",
         ));
     }
-    if !link_metadata.is_file() {
-        return Err(invalid_data_error(path, "expected a regular file"));
+    ensure_regular(path, &metadata)
+}
+
+fn ensure_regular(path: &Path, metadata: &fs::Metadata) -> Result<(), ClangAdapterError> {
+    if metadata.is_file() {
+        Ok(())
+    } else {
+        Err(invalid_data_error(path, "expected a regular file"))
     }
-    let canonical = canonical_file(path)?;
-    let metadata = fs::metadata(&canonical).map_err(|source| ClangAdapterError::Read {
-        path: canonical.display().to_string(),
-        source,
-    })?;
-    if !metadata.is_file() {
-        return Err(invalid_data_error(&canonical, "expected a regular file"));
-    }
-    Ok(canonical)
+}
+
+fn path_metadata(
+    path: &Path,
+    read: impl FnOnce(&Path) -> std::io::Result<fs::Metadata>,
+) -> Result<fs::Metadata, ClangAdapterError> {
+    io_at_path(path, read(path))
+}
+
+fn io_at_path<T>(path: &Path, result: std::io::Result<T>) -> Result<T, ClangAdapterError> {
+    result.map_err(|source| read_error(path, source))
 }
 
 fn canonical_directory(path: &Path) -> Result<PathBuf, ClangAdapterError> {
     let canonical = canonical_file(path)?;
-    let metadata = fs::metadata(&canonical).map_err(|source| ClangAdapterError::Read {
-        path: canonical.display().to_string(),
-        source,
-    })?;
-    if !metadata.is_dir() {
-        return Err(ClangAdapterError::InvalidRoot {
-            path: path.display().to_string(),
-        });
+    if path_metadata(&canonical, |candidate| fs::metadata(candidate))?.is_dir() {
+        Ok(canonical)
+    } else {
+        Err(invalid_root(path))
     }
-    Ok(canonical)
 }
 
 fn automatic_candidate(path: &Path, canonical_root: &Path) -> Result<Option<PathBuf>, ClangAdapterError> {
-    let metadata = match fs::symlink_metadata(path) {
-        Ok(metadata) => metadata,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(ClangAdapterError::Read {
-                path: path.display().to_string(),
-                source,
-            });
+    match candidate_file(path)? {
+        Some(canonical) => {
+            ensure_inside_root(path, &canonical, canonical_root)?;
+            Ok(Some(canonical))
         }
+        None => Ok(None),
+    }
+}
+
+fn candidate_file(path: &Path) -> Result<Option<PathBuf>, ClangAdapterError> {
+    let Some(metadata) = optional_metadata(path)? else {
+        return Ok(None);
     };
     if metadata.file_type().is_symlink() {
         return Err(invalid_data_error(
@@ -373,24 +493,56 @@ fn automatic_candidate(path: &Path, canonical_root: &Path) -> Result<Option<Path
     if !metadata.is_file() {
         return Ok(None);
     }
-    let canonical = canonical_regular_file(path)?;
-    if !canonical.starts_with(canonical_root) {
+    canonical_regular_file(path).map(Some)
+}
+
+fn ensure_inside_root(path: &Path, canonical: &Path, root: &Path) -> Result<(), ClangAdapterError> {
+    if !canonical.starts_with(root) {
         return Err(invalid_data_error(
             path,
             format!(
                 "automatically discovered database resolves outside project root {}",
-                canonical_root.display()
+                root.display()
             ),
         ));
     }
-    Ok(Some(canonical))
+    Ok(())
+}
+
+fn optional_metadata(path: &Path) -> Result<Option<fs::Metadata>, ClangAdapterError> {
+    fs::symlink_metadata(path).map(Some).or_else(|source| {
+        if source.kind() == std::io::ErrorKind::NotFound {
+            Ok(None)
+        } else {
+            Err(read_error(path, source))
+        }
+    })
 }
 
 fn invalid_data_error(path: &Path, message: impl Into<String>) -> ClangAdapterError {
     ClangAdapterError::Read {
-        path: path.display().to_string(),
+        operation: "validate",
+        path: display_path(path),
         source: std::io::Error::new(std::io::ErrorKind::InvalidData, message.into()),
     }
+}
+
+fn invalid_root(path: &Path) -> ClangAdapterError {
+    ClangAdapterError::InvalidRoot {
+        path: display_path(path),
+    }
+}
+
+fn read_error(path: &Path, source: std::io::Error) -> ClangAdapterError {
+    ClangAdapterError::Read {
+        operation: "read",
+        path: display_path(path),
+        source,
+    }
+}
+
+fn display_path(path: &Path) -> String {
+    path.display().to_string()
 }
 
 /// Parse a JSON compilation database and preserve each record's exact command
@@ -402,7 +554,10 @@ fn invalid_data_error(path: &Path, message: impl Into<String>) -> ClangAdapterEr
 /// Returns an error when the database cannot be read, contains malformed JSON,
 /// has invalid entries, or relies on unsupported shell syntax.
 pub fn load_database(path: &Path) -> Result<CompilationDatabase, ClangAdapterError> {
-    let path = canonical_regular_file(path)?;
+    canonical_regular_file(path).and_then(load_canonical_database)
+}
+
+fn load_canonical_database(path: PathBuf) -> Result<CompilationDatabase, ClangAdapterError> {
     let contents = read_database_bytes(&path)?;
     let RawCompileCommands(raw) =
         serde_json::from_slice(&contents).map_err(|error| ClangAdapterError::Parse {
@@ -420,41 +575,63 @@ pub fn load_database(path: &Path) -> Result<CompilationDatabase, ClangAdapterErr
 }
 
 fn read_database_bytes(path: &Path) -> Result<Vec<u8>, ClangAdapterError> {
-    let file = File::open(path).map_err(|source| ClangAdapterError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    let metadata = file.metadata().map_err(|source| ClangAdapterError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    if !metadata.is_file() {
-        return Err(invalid_data_error(path, "expected a regular file"));
-    }
-    if metadata.len() > MAX_DATABASE_BYTES {
-        return Err(invalid_data_error(
-            path,
-            format!("database exceeds the {MAX_DATABASE_BYTES}-byte limit"),
-        ));
-    }
-    let initial_capacity = usize::try_from(metadata.len())
-        .map_err(|_| invalid_data_error(path, "database size cannot be represented on this platform"))?;
-    let maximum_capacity = usize::try_from(MAX_DATABASE_BYTES)
-        .map_err(|_| invalid_data_error(path, "database limit cannot be represented on this platform"))?;
+    let (file, length) = open_database(path)?;
+    let (initial_capacity, maximum_capacity) = database_capacities(path, length)?;
+    read_bounded_database(file, path, initial_capacity, maximum_capacity)
+}
+
+fn open_database(path: &Path) -> Result<(File, u64), ClangAdapterError> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(source) => return Err(read_error(path, source)),
+    };
+    let metadata = file.metadata().map_err(|source| read_error(path, source))?;
+    validate_database_size(path, &metadata)?;
+    Ok((file, metadata.len()))
+}
+
+fn read_bounded_database(
+    file: File,
+    path: &Path,
+    initial_capacity: usize,
+    maximum_capacity: usize,
+) -> Result<Vec<u8>, ClangAdapterError> {
     let mut contents = Vec::with_capacity(initial_capacity.saturating_add(1));
     file.take(MAX_DATABASE_BYTES + 1)
         .read_to_end(&mut contents)
-        .map_err(|source| ClangAdapterError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
-    if contents.len() > maximum_capacity {
-        return Err(invalid_data_error(
-            path,
-            format!("database exceeds the {MAX_DATABASE_BYTES}-byte limit while reading"),
-        ));
-    }
+        .map_err(|source| read_error(path, source))?;
+    enforce_database_limit(path, contents.len(), maximum_capacity, " while reading")?;
     Ok(contents)
+}
+
+fn validate_database_size(path: &Path, metadata: &fs::Metadata) -> Result<(), ClangAdapterError> {
+    ensure_regular(path, metadata)?;
+    let actual = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    let maximum = usize::try_from(MAX_DATABASE_BYTES).unwrap_or(usize::MAX);
+    enforce_database_limit(path, actual, maximum, "")
+}
+
+fn enforce_database_limit(
+    path: &Path,
+    actual: usize,
+    maximum: usize,
+    context: &str,
+) -> Result<(), ClangAdapterError> {
+    if actual <= maximum {
+        return Ok(());
+    }
+    Err(invalid_data_error(
+        path,
+        format!("database exceeds the {MAX_DATABASE_BYTES}-byte limit{context}"),
+    ))
+}
+
+fn database_capacities(path: &Path, length: u64) -> Result<(usize, usize), ClangAdapterError> {
+    let initial = usize::try_from(length)
+        .map_err(|_| invalid_data_error(path, "database size cannot be represented on this platform"))?;
+    let maximum = usize::try_from(MAX_DATABASE_BYTES)
+        .map_err(|_| invalid_data_error(path, "database limit cannot be represented on this platform"))?;
+    Ok((initial, maximum))
 }
 
 fn compile_command_from_raw(
@@ -464,58 +641,9 @@ fn compile_command_from_raw(
     entry: RawCompileCommand,
 ) -> Result<CompileCommand, ClangAdapterError> {
     validate_entry_fields(path, index, &entry)?;
-    let (arguments, origin) = match (entry.arguments, entry.command) {
-        (Some(LimitedArguments(arguments)), None) if !arguments.is_empty() => {
-            validate_arguments(path, index, &arguments)?;
-            (arguments.clone(), CommandOrigin::Arguments(arguments))
-        }
-        (None, Some(command)) => {
-            if command.len() > MAX_COMMAND_BYTES {
-                return Err(invalid_entry(
-                    path,
-                    index,
-                    format!("command exceeds the {MAX_COMMAND_BYTES}-byte limit"),
-                ));
-            }
-            let arguments = tokenize_command(&command).map_err(|source| ClangAdapterError::Tokenize {
-                path: path.display().to_string(),
-                index,
-                source,
-            })?;
-            validate_arguments(path, index, &arguments)?;
-            (arguments, CommandOrigin::Command(command))
-        }
-        (Some(_), Some(_)) => {
-            return Err(invalid_entry(
-                path,
-                index,
-                "both arguments and command are present",
-            ));
-        }
-        (Some(_), None) => return Err(invalid_entry(path, index, "arguments is empty")),
-        (None, None) => {
-            return Err(invalid_entry(
-                path,
-                index,
-                "neither arguments nor command is present",
-            ));
-        }
-    };
-    if entry.directory.is_empty() || entry.file.is_empty() {
-        return Err(invalid_entry(path, index, "directory and file must be non-empty"));
-    }
-    let raw_directory = Path::new(&entry.directory);
-    let directory = if raw_directory.is_absolute() {
-        normalize_path(raw_directory)
-    } else {
-        normalize_path(&database_directory.join(raw_directory))
-    };
-    let raw_file = Path::new(&entry.file);
-    let file = if raw_file.is_absolute() {
-        normalize_path(raw_file)
-    } else {
-        normalize_path(&directory.join(raw_file))
-    };
+    let (arguments, origin) = command_arguments(path, index, entry.arguments, entry.command)?;
+    let directory = resolve_path(database_directory, Path::new(&entry.directory));
+    let file = resolve_path(&directory, Path::new(&entry.file));
     Ok(CompileCommand {
         directory,
         file,
@@ -525,69 +653,155 @@ fn compile_command_from_raw(
     })
 }
 
+fn command_arguments(
+    path: &Path,
+    index: usize,
+    arguments: Option<LimitedArguments>,
+    command: Option<String>,
+) -> Result<(Vec<String>, CommandOrigin), ClangAdapterError> {
+    match (arguments, command) {
+        (Some(arguments), None) => arguments_origin(path, index, arguments.0),
+        (None, Some(command)) => command_origin(path, index, command),
+        (Some(_), Some(_)) => Err(invalid_entry(
+            path,
+            index,
+            "both arguments and command are present",
+        )),
+        (None, None) => Err(invalid_entry(
+            path,
+            index,
+            "neither arguments nor command is present",
+        )),
+    }
+}
+
+fn arguments_origin(
+    path: &Path,
+    index: usize,
+    arguments: Vec<String>,
+) -> Result<(Vec<String>, CommandOrigin), ClangAdapterError> {
+    if arguments.is_empty() {
+        return Err(invalid_entry(path, index, "arguments is empty"));
+    }
+    validate_arguments(path, index, &arguments)?;
+    Ok((arguments.clone(), CommandOrigin::Arguments(arguments)))
+}
+
+fn command_origin(
+    path: &Path,
+    index: usize,
+    command: String,
+) -> Result<(Vec<String>, CommandOrigin), ClangAdapterError> {
+    validate_limit(path, index, command.len(), MAX_COMMAND_BYTES, EntryLimit::Command)?;
+    let arguments = tokenize_command(&command).map_err(|source| ClangAdapterError::Tokenize {
+        path: path.display().to_string(),
+        index,
+        source,
+    })?;
+    validate_arguments(path, index, &arguments)?;
+    Ok((arguments, CommandOrigin::Command(command)))
+}
+
+fn resolve_path(base: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        normalize_path(path)
+    } else {
+        normalize_path(&base.join(path))
+    }
+}
+
 fn validate_entry_fields(
     path: &Path,
     index: usize,
     entry: &RawCompileCommand,
 ) -> Result<(), ClangAdapterError> {
+    if entry.directory.is_empty() || entry.file.is_empty() {
+        return Err(invalid_entry(path, index, "directory and file must be non-empty"));
+    }
     for (name, value) in [
         ("directory", entry.directory.as_str()),
         ("file", entry.file.as_str()),
     ] {
-        if value.len() > MAX_PATH_FIELD_BYTES {
-            return Err(invalid_entry(
-                path,
-                index,
-                format!("{name} exceeds the {MAX_PATH_FIELD_BYTES}-byte limit"),
-            ));
-        }
-    }
-    if entry
-        .output
-        .as_ref()
-        .is_some_and(|output| output.len() > MAX_PATH_FIELD_BYTES)
-    {
-        return Err(invalid_entry(
+        validate_limit(
             path,
             index,
-            format!("output exceeds the {MAX_PATH_FIELD_BYTES}-byte limit"),
-        ));
+            value.len(),
+            MAX_PATH_FIELD_BYTES,
+            EntryLimit::Path(name),
+        )?;
     }
+    let output_length = entry.output.as_ref().map_or(0, String::len);
+    validate_limit(
+        path,
+        index,
+        output_length,
+        MAX_PATH_FIELD_BYTES,
+        EntryLimit::Path("output"),
+    )?;
     Ok(())
 }
 
 fn validate_arguments(path: &Path, index: usize, arguments: &[String]) -> Result<(), ClangAdapterError> {
-    if arguments.len() > MAX_ARGUMENTS_PER_ENTRY {
-        return Err(invalid_entry(
-            path,
-            index,
-            format!("argv exceeds the {MAX_ARGUMENTS_PER_ENTRY}-argument limit"),
-        ));
-    }
+    validate_limit(
+        path,
+        index,
+        arguments.len(),
+        MAX_ARGUMENTS_PER_ENTRY,
+        EntryLimit::ArgumentCount,
+    )?;
     let mut total_bytes = 0_usize;
     for argument in arguments {
-        if argument.len() > MAX_ARGUMENT_BYTES {
-            return Err(invalid_entry(
-                path,
-                index,
-                format!("argument exceeds the {MAX_ARGUMENT_BYTES}-byte token limit"),
-            ));
-        }
+        validate_limit(path, index, argument.len(), MAX_ARGUMENT_BYTES, EntryLimit::Token)?;
         total_bytes = total_bytes.saturating_add(argument.len());
-        if total_bytes > MAX_ARGUMENT_BYTES_PER_ENTRY {
-            return Err(invalid_entry(
-                path,
-                index,
-                format!("argv exceeds the {MAX_ARGUMENT_BYTES_PER_ENTRY}-byte aggregate limit"),
-            ));
-        }
+        validate_limit(
+            path,
+            index,
+            total_bytes,
+            MAX_ARGUMENT_BYTES_PER_ENTRY,
+            EntryLimit::Aggregate,
+        )?;
     }
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum EntryLimit<'a> {
+    Command,
+    Path(&'a str),
+    ArgumentCount,
+    Token,
+    Aggregate,
+}
+
+impl EntryLimit<'_> {
+    fn message(&self, maximum: usize) -> String {
+        match self {
+            Self::Command => format!("command exceeds the {maximum}-byte limit"),
+            Self::Path(name) => format!("{name} exceeds the {maximum}-byte limit"),
+            Self::ArgumentCount => format!("argv exceeds the {maximum}-argument limit"),
+            Self::Token => format!("argument exceeds the {maximum}-byte token limit"),
+            Self::Aggregate => format!("argv exceeds the {maximum}-byte aggregate limit"),
+        }
+    }
+}
+
+fn validate_limit(
+    path: &Path,
+    index: usize,
+    actual: usize,
+    maximum: usize,
+    kind: EntryLimit<'_>,
+) -> Result<(), ClangAdapterError> {
+    if actual > maximum {
+        Err(invalid_entry(path, index, kind.message(maximum)))
+    } else {
+        Ok(())
+    }
+}
+
 fn invalid_entry(path: &Path, index: usize, message: impl Into<String>) -> ClangAdapterError {
     ClangAdapterError::InvalidEntry {
-        path: path.display().to_string(),
+        path: display_path(path),
         index,
         message: message.into(),
     }
@@ -655,13 +869,18 @@ fn parse_language_name(value: &str) -> Option<ClangLanguage> {
 
 fn language_from_path(path: &Path) -> Option<ClangLanguage> {
     let extension = path.extension()?.to_str()?;
-    match extension {
-        "c" | "i" => Some(ClangLanguage::C),
-        "C" | "cc" | "cp" | "cpp" | "cxx" | "c++" | "ii" | "CPP" | "CXX" => Some(ClangLanguage::Cpp),
-        "m" | "mi" => Some(ClangLanguage::ObjectiveC),
-        "mm" | "mii" | "M" => Some(ClangLanguage::ObjectiveCpp),
-        _ => None,
-    }
+    LANGUAGE_EXTENSIONS
+        .split(';')
+        .find_map(|mapping| language_mapping(mapping, extension))
+}
+
+fn language_mapping(mapping: &str, extension: &str) -> Option<ClangLanguage> {
+    let (extensions, language) = mapping.split_once('=')?;
+    extensions
+        .split(',')
+        .any(|candidate| candidate == extension)
+        .then(|| parse_language_name(language))
+        .flatten()
 }
 
 fn language_from_driver(arguments: &[String]) -> Option<ClangLanguage> {
@@ -681,49 +900,87 @@ fn language_from_driver(arguments: &[String]) -> Option<ClangLanguage> {
 mod tests {
     use std::fs::{self, File};
 
-    use tempfile::tempdir;
-
     use super::*;
+    use crate::test_support::{compile_command, create_dir, expect_error, temp_dir, write, write_database};
 
-    fn compile_command(file: &str, arguments: &[&str]) -> CompileCommand {
-        CompileCommand {
-            directory: PathBuf::from("/project"),
-            file: PathBuf::from(file),
-            arguments: arguments.iter().map(ToString::to_string).collect(),
-            output: None,
-            origin: CommandOrigin::Arguments(arguments.iter().map(ToString::to_string).collect()),
+    fn project_command(file: &str, arguments: &[&str]) -> CompileCommand {
+        compile_command(Path::new("/project"), file, arguments)
+    }
+
+    fn assert_adapter_error<T: std::fmt::Debug>(result: Result<T, ClangAdapterError>, expected: &str) {
+        assert!(expect_error(result).to_string().contains(expected));
+    }
+
+    fn discover(root: &Path) -> Option<PathBuf> {
+        discover_compilation_database(root).unwrap_or_else(|error| panic!("discover database: {error}"))
+    }
+
+    fn discovered(root: &Path) -> PathBuf {
+        discover(root).unwrap_or_else(|| panic!("missing compilation database"))
+    }
+
+    fn database_fixture(contents: impl AsRef<[u8]>) -> (tempfile::TempDir, PathBuf) {
+        let temp = temp_dir();
+        let database = write_database(temp.path(), contents);
+        (temp, database)
+    }
+
+    fn assert_database_rejected(contents: impl AsRef<[u8]>, expected: &str) {
+        let (_temp, database) = database_fixture(contents);
+        assert_adapter_error(load_database(&database), expected);
+    }
+
+    fn entry_database(field: &str, value: impl serde::Serialize) -> String {
+        let mut entry = serde_json::json!({"directory": ".", "file": "a.c"});
+        entry[field] = serde_json::to_value(value)
+            .unwrap_or_else(|error| panic!("serialize database fixture field: {error}"));
+        serde_json::json!([entry]).to_string()
+    }
+
+    fn raw_entry(file: String, output: Option<String>) -> RawCompileCommand {
+        RawCompileCommand {
+            directory: ".".to_string(),
+            file,
+            arguments: None,
+            command: Some("clang a.c".to_string()),
+            output,
         }
     }
 
-    fn expect_adapter_error<T: std::fmt::Debug>(result: Result<T, ClangAdapterError>) -> ClangAdapterError {
-        match result {
-            Ok(value) => panic!("expected adapter error, got {value:?}"),
-            Err(error) => error,
-        }
+    #[cfg(unix)]
+    fn database_symlink(project: &Path) -> PathBuf {
+        let target = project.join("actual-database.json");
+        write(&target, "[]");
+        let candidate = project.join(DATABASE_NAME);
+        std::os::unix::fs::symlink(target, &candidate)
+            .unwrap_or_else(|error| panic!("link database fixture: {error}"));
+        candidate
+    }
+
+    #[cfg(unix)]
+    fn outside_build_symlink(project: &Path) -> tempfile::TempDir {
+        let external = temp_dir();
+        let build = external.path().join("external-build");
+        create_dir(&build);
+        write_database(&build, "[]");
+        std::os::unix::fs::symlink(build, project.join("build"))
+            .unwrap_or_else(|error| panic!("link external build fixture: {error}"));
+        external
     }
 
     #[test]
     fn discovers_root_before_build_and_never_generates_a_database() {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        assert_eq!(
-            discover_compilation_database(temp.path()).unwrap_or_else(|error| panic!("discover: {error}")),
-            None
-        );
+        let temp = temp_dir();
+        assert_eq!(discover(temp.path()), None);
         assert!(!temp.path().join(DATABASE_NAME).exists());
 
-        fs::create_dir(temp.path().join("build")).unwrap_or_else(|error| panic!("create build: {error}"));
-        fs::write(temp.path().join("build").join(DATABASE_NAME), "[]")
-            .unwrap_or_else(|error| panic!("write build db: {error}"));
-        let build = discover_compilation_database(temp.path())
-            .unwrap_or_else(|error| panic!("discover build: {error}"))
-            .unwrap_or_else(|| panic!("missing build database"));
+        create_dir(temp.path().join("build"));
+        write(temp.path().join("build").join(DATABASE_NAME), "[]");
+        let build = discovered(temp.path());
         assert!(build.ends_with("build/compile_commands.json"));
 
-        fs::write(temp.path().join(DATABASE_NAME), "[]")
-            .unwrap_or_else(|error| panic!("write root db: {error}"));
-        let root = discover_compilation_database(temp.path())
-            .unwrap_or_else(|error| panic!("discover root: {error}"))
-            .unwrap_or_else(|| panic!("missing root database"));
+        write(temp.path().join(DATABASE_NAME), "[]");
+        let root = discovered(temp.path());
         assert_eq!(
             root,
             temp.path()
@@ -735,16 +992,11 @@ mod tests {
 
     #[test]
     fn loads_arguments_and_command_records_with_provenance() {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        let database = temp.path().join(DATABASE_NAME);
-        fs::write(
-            &database,
-            r#"[
+        const DATABASE: &str = r#"[
                 {"directory":".","file":"src/a.c","arguments":["clang","-c","src/a.c"]},
                 {"directory":".","file":"src/b.cpp","command":"clang++ -c 'src/b.cpp'","output":"b.o"}
-            ]"#,
-        )
-        .unwrap_or_else(|error| panic!("write db: {error}"));
+            ]"#;
+        let (temp, database) = database_fixture(DATABASE);
 
         let loaded = load_database(&database).unwrap_or_else(|error| panic!("load: {error}"));
         assert_eq!(loaded.commands.len(), 2);
@@ -765,22 +1017,16 @@ mod tests {
 
     #[test]
     fn rejects_sparse_database_larger_than_the_file_limit() {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let temp = temp_dir();
         let database = temp.path().join(DATABASE_NAME);
-        let file = File::create(&database).unwrap_or_else(|error| panic!("create sparse db: {error}"));
+        let file = match File::create(&database) {
+            Ok(file) => file,
+            Err(error) => panic!("create sparse db: {error}"),
+        };
         file.set_len(MAX_DATABASE_BYTES + 1)
             .unwrap_or_else(|error| panic!("size sparse db: {error}"));
 
-        let error = expect_adapter_error(load_database(&database));
-        assert!(error.to_string().contains("67108864-byte limit"));
-    }
-
-    #[test]
-    fn rejects_non_regular_database_paths() {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-
-        let error = expect_adapter_error(load_database(temp.path()));
-        assert!(error.to_string().contains("expected a regular file"));
+        assert_adapter_error(load_database(&database), "67108864-byte limit");
     }
 
     #[cfg(unix)]
@@ -788,61 +1034,56 @@ mod tests {
     fn rejects_non_regular_socket_without_opening_it_as_a_database() {
         use std::os::unix::net::UnixListener;
 
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let temp = temp_dir();
         let socket = temp.path().join(DATABASE_NAME);
         let _listener = UnixListener::bind(&socket).unwrap_or_else(|error| panic!("bind socket: {error}"));
 
-        let error = expect_adapter_error(load_database(&socket));
-        assert!(error.to_string().contains("expected a regular file"));
+        assert_adapter_error(load_database(&socket), "expected a regular file");
+    }
+
+    #[test]
+    fn rejects_non_regular_database_paths() {
+        let temp = temp_dir();
+        assert_adapter_error(load_database(temp.path()), "expected a regular file");
     }
 
     #[cfg(unix)]
     #[test]
     fn rejects_database_symlinks_and_out_of_root_intermediate_symlinks() {
-        use std::os::unix::fs::symlink;
+        let project = temp_dir();
+        let candidate = database_symlink(project.path());
 
-        let project = tempdir().unwrap_or_else(|error| panic!("project tempdir: {error}"));
-        let in_root_target = project.path().join("actual-database.json");
-        fs::write(&in_root_target, "[]").unwrap_or_else(|error| panic!("write in-root db: {error}"));
-        let candidate = project.path().join(DATABASE_NAME);
-        symlink(&in_root_target, &candidate).unwrap_or_else(|error| panic!("link in-root db: {error}"));
-
-        let discovery_error = expect_adapter_error(discover_compilation_database(project.path()));
-        assert!(discovery_error
-            .to_string()
-            .contains("symbolic links are not accepted"));
-        let load_error = expect_adapter_error(load_database(&candidate));
-        assert!(load_error.to_string().contains("symbolic links are not accepted"));
+        assert_adapter_error(
+            discover_compilation_database(project.path()),
+            "symbolic links are not accepted",
+        );
+        assert_adapter_error(load_database(&candidate), "symbolic links are not accepted");
 
         fs::remove_file(&candidate).unwrap_or_else(|error| panic!("remove in-root symlink: {error}"));
-        let external = tempdir().unwrap_or_else(|error| panic!("external tempdir: {error}"));
-        let external_build = external.path().join("external-build");
-        fs::create_dir(&external_build).unwrap_or_else(|error| panic!("create external build: {error}"));
-        let external_database = external_build.join(DATABASE_NAME);
-        fs::write(&external_database, "[]").unwrap_or_else(|error| panic!("write external db: {error}"));
-        symlink(&external_build, project.path().join("build"))
-            .unwrap_or_else(|error| panic!("link external build: {error}"));
+        let _external = outside_build_symlink(project.path());
 
-        let error = expect_adapter_error(discover_compilation_database(project.path()));
-        assert!(error.to_string().contains("resolves outside project root"));
+        assert_adapter_error(
+            discover_compilation_database(project.path()),
+            "resolves outside project root",
+        );
     }
 
     #[test]
     fn bounds_immediate_child_enumeration() {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let temp = temp_dir();
         for index in 0..=MAX_DISCOVERY_ENTRIES {
             File::create(temp.path().join(format!("entry-{index}")))
                 .unwrap_or_else(|error| panic!("create discovery entry {index}: {error}"));
         }
 
-        let error = expect_adapter_error(discover_compilation_database(temp.path()));
-        assert!(error.to_string().contains("4096-entry discovery limit"));
+        assert_adapter_error(
+            discover_compilation_database(temp.path()),
+            "4096-entry discovery limit",
+        );
     }
 
     #[test]
     fn rejects_database_entry_count_above_limit_while_deserializing() {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        let database = temp.path().join(DATABASE_NAME);
         let entry = r#"{"directory":".","file":"a.c","arguments":["clang"]}"#;
         let mut contents = String::with_capacity(entry.len() * (MAX_DATABASE_ENTRIES + 1));
         contents.push('[');
@@ -854,96 +1095,87 @@ mod tests {
         }
         contents.push(']');
         assert!(u64::try_from(contents.len()).unwrap_or(u64::MAX) < MAX_DATABASE_BYTES);
-        fs::write(&database, contents).unwrap_or_else(|error| panic!("write entry-heavy db: {error}"));
-
-        let error = expect_adapter_error(load_database(&database));
-        assert!(error.to_string().contains("exceeds the 100000-entry limit"));
+        assert_database_rejected(contents, "exceeds the 100000-entry limit");
     }
 
     #[test]
     fn bounds_command_and_argument_payloads() {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        let database = temp.path().join(DATABASE_NAME);
         let command = "x".repeat(MAX_COMMAND_BYTES + 1);
-        fs::write(
-            &database,
-            serde_json::json!([{"directory": ".", "file": "a.c", "command": command}]).to_string(),
-        )
-        .unwrap_or_else(|error| panic!("write command-heavy db: {error}"));
-        assert!(expect_adapter_error(load_database(&database))
-            .to_string()
-            .contains("command exceeds the 1048576-byte limit"));
+        assert_database_rejected(
+            entry_database("command", command),
+            "command exceeds the 1048576-byte limit",
+        );
 
         let oversized_token = "x".repeat(MAX_ARGUMENT_BYTES + 1);
-        fs::write(
-            &database,
-            serde_json::json!([{
-                "directory": ".",
-                "file": "a.c",
-                "arguments": ["clang", oversized_token]
-            }])
-            .to_string(),
-        )
-        .unwrap_or_else(|error| panic!("write token-heavy db: {error}"));
-        assert!(expect_adapter_error(load_database(&database))
-            .to_string()
-            .contains("65536-byte token limit"));
+        assert_database_rejected(
+            entry_database("arguments", ["clang".to_string(), oversized_token]),
+            "65536-byte token limit",
+        );
 
         let aggregate_arguments = vec!["x".repeat(MAX_ARGUMENT_BYTES); 17];
-        fs::write(
-            &database,
-            serde_json::json!([{
-                "directory": ".",
-                "file": "a.c",
-                "arguments": aggregate_arguments
-            }])
-            .to_string(),
-        )
-        .unwrap_or_else(|error| panic!("write aggregate argv-heavy db: {error}"));
-        assert!(expect_adapter_error(load_database(&database))
-            .to_string()
-            .contains("1048576-byte aggregate limit"));
+        assert_database_rejected(
+            entry_database("arguments", aggregate_arguments),
+            "1048576-byte aggregate limit",
+        );
 
         let arguments = vec!["x"; MAX_ARGUMENTS_PER_ENTRY + 1];
-        fs::write(
-            &database,
-            serde_json::json!([{
-                "directory": ".",
-                "file": "a.c",
-                "arguments": arguments
-            }])
-            .to_string(),
-        )
-        .unwrap_or_else(|error| panic!("write argv-heavy db: {error}"));
-        assert!(expect_adapter_error(load_database(&database))
-            .to_string()
-            .contains("4096-argument limit"));
+        assert_database_rejected(entry_database("arguments", arguments), "4096-argument limit");
 
         let oversized_path = "x".repeat(MAX_PATH_FIELD_BYTES + 1);
-        fs::write(
-            &database,
-            serde_json::json!([{
-                "directory": oversized_path,
-                "file": "a.c",
-                "arguments": ["clang"]
-            }])
-            .to_string(),
-        )
-        .unwrap_or_else(|error| panic!("write path-heavy db: {error}"));
-        assert!(expect_adapter_error(load_database(&database))
-            .to_string()
-            .contains("directory exceeds the 65536-byte limit"));
+        assert_database_rejected(
+            entry_database("directory", oversized_path),
+            "directory exceeds the 65536-byte limit",
+        );
+    }
+
+    #[test]
+    fn direct_entry_validation_enforces_every_bound() {
+        let path = Path::new("compile_commands.json");
+        let valid = raw_entry("a.c".to_string(), Some("a.o".to_string()));
+        assert!(validate_entry_fields(path, 0, &valid).is_ok());
+
+        let mut empty = valid;
+        empty.file.clear();
+        assert_adapter_error(validate_entry_fields(path, 0, &empty), "must be non-empty");
+
+        let oversized_file = raw_entry("x".repeat(MAX_PATH_FIELD_BYTES + 1), None);
+        assert!(validate_entry_fields(path, 0, &oversized_file).is_err());
+        let oversized_output = raw_entry("a.c".to_string(), Some("x".repeat(MAX_PATH_FIELD_BYTES + 1)));
+        assert!(validate_entry_fields(path, 0, &oversized_output).is_err());
+
+        assert!(validate_arguments(path, 0, &["clang".to_string()]).is_ok());
+        assert!(validate_arguments(path, 0, &vec!["x".to_string(); MAX_ARGUMENTS_PER_ENTRY + 1]).is_err());
+        assert!(validate_arguments(path, 0, &["x".repeat(MAX_ARGUMENT_BYTES + 1)]).is_err());
+        assert!(validate_arguments(path, 0, &vec!["x".repeat(MAX_ARGUMENT_BYTES); 17]).is_err());
+    }
+
+    #[test]
+    fn path_normalization_and_explicit_language_cover_boundary_forms() {
+        const CASES: &str = "clang a.c|none
+clang -xc++ a.c|cpp
+clang -x none a.c|none
+clang -x|unsupported
+clang -xcuda a.c|unsupported";
+
+        assert_eq!(normalize_path(Path::new("a/./b/../c")), PathBuf::from("a/c"));
+        assert_eq!(normalize_path(Path::new("../a")), PathBuf::from("../a"));
+
+        for case in CASES.lines() {
+            let (arguments, expected) = case
+                .split_once('|')
+                .unwrap_or_else(|| panic!("invalid explicit-language case: {case}"));
+            let arguments = crate::test_support::owned_words(arguments);
+            assert_eq!(
+                explicit_language(&arguments),
+                expected_explicit_language(expected)
+            );
+        }
     }
 
     #[test]
     fn rejects_ambiguous_or_shell_dependent_commands() {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        let database = temp.path().join(DATABASE_NAME);
-        fs::write(
-            &database,
-            r#"[{"directory":".","file":"a.c","command":"clang a.c && touch bad"}]"#,
-        )
-        .unwrap_or_else(|error| panic!("write db: {error}"));
+        let (_temp, database) =
+            database_fixture(r#"[{"directory":".","file":"a.c","command":"clang a.c && touch bad"}]"#);
         assert!(matches!(
             load_database(&database),
             Err(ClangAdapterError::Tokenize { .. })
@@ -952,33 +1184,43 @@ mod tests {
 
     #[test]
     fn classifies_all_clang_language_modes() {
-        assert_eq!(
-            ClangLanguage::classify(&compile_command("a.c", &["clang", "a.c"])),
-            Some(ClangLanguage::C)
-        );
-        assert_eq!(
-            ClangLanguage::classify(&compile_command("a.C", &["clang", "a.C"])),
-            Some(ClangLanguage::Cpp)
-        );
-        assert_eq!(
-            ClangLanguage::classify(&compile_command("a.m", &["clang", "a.m"])),
-            Some(ClangLanguage::ObjectiveC)
-        );
-        assert_eq!(
-            ClangLanguage::classify(&compile_command("a.mm", &["clang++", "a.mm"])),
-            Some(ClangLanguage::ObjectiveCpp)
-        );
-        assert_eq!(
-            ClangLanguage::classify(&compile_command("a.c", &["clang", "-x", "objective-c++", "a.c"])),
-            Some(ClangLanguage::ObjectiveCpp)
-        );
-        assert_eq!(
-            ClangLanguage::classify(&compile_command("header.h", &["clang++", "header.h"])),
-            Some(ClangLanguage::Cpp)
-        );
-        assert_eq!(
-            ClangLanguage::classify(&compile_command("a.c", &["clang", "-x", "cuda", "a.c"])),
-            None
-        );
+        const CASES: &str = "a.c|clang a.c|c
+a.C|clang a.C|cpp
+a.m|clang a.m|objective-c
+a.mm|clang++ a.mm|objective-cpp
+a.c|clang -x objective-c++ a.c|objective-cpp
+        header.h|clang++ header.h|cpp
+a.c|clang -x cuda a.c|none";
+        for case in CASES.lines() {
+            let fields = case.split('|').collect::<Vec<_>>();
+            let [file, arguments, expected] = fields.as_slice() else {
+                panic!("invalid language case: {case}");
+            };
+            let arguments = arguments.split_ascii_whitespace().collect::<Vec<_>>();
+            assert_eq!(
+                ClangLanguage::classify(&project_command(file, &arguments)),
+                expected_language(expected)
+            );
+        }
+    }
+
+    fn expected_language(name: &str) -> Option<ClangLanguage> {
+        match name {
+            "c" => Some(ClangLanguage::C),
+            "cpp" => Some(ClangLanguage::Cpp),
+            "objective-c" => Some(ClangLanguage::ObjectiveC),
+            "objective-cpp" => Some(ClangLanguage::ObjectiveCpp),
+            _ => None,
+        }
+    }
+
+    fn expected_explicit_language(name: &str) -> ExplicitLanguage {
+        match name {
+            "none" => ExplicitLanguage::NotSpecified,
+            "unsupported" => ExplicitLanguage::Unsupported,
+            other => {
+                expected_language(other).map_or(ExplicitLanguage::Unsupported, ExplicitLanguage::Supported)
+            }
+        }
     }
 }

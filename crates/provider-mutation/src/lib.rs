@@ -7,10 +7,15 @@
 //! reporigor's checkout-restoration contract; callers can still import an
 //! existing Mutation Testing Elements v2 report.
 
+use std::io;
+use std::path::PathBuf;
+
 mod command;
 mod import;
 mod inventory;
 mod model;
+#[cfg(test)]
+mod test_support;
 
 pub use command::{CommandOutput, CommandRunner, SystemCommandRunner};
 pub use import::{import_json, import_path};
@@ -22,6 +27,16 @@ pub use model::{
     MutationProvider, MutationProviderOptions, MutationProviderStatus, ProviderInventory,
 };
 
+fn canonical_root(root: &std::path::Path) -> Result<PathBuf, ProviderError> {
+    if !root.is_dir() {
+        return Err(ProviderError::InvalidRoot(root.to_path_buf()));
+    }
+    std::fs::canonicalize(root).map_err(|source| ProviderError::Io {
+        path: root.to_path_buf(),
+        source,
+    })
+}
+
 /// Errors returned by mutation-provider discovery, probing, and report import.
 #[derive(Debug, thiserror::Error)]
 pub enum ProviderError {
@@ -29,9 +44,9 @@ pub enum ProviderError {
     InvalidRoot(std::path::PathBuf),
     #[error("failed to inspect {path}: {source}")]
     Io {
-        path: std::path::PathBuf,
+        path: PathBuf,
         #[source]
-        source: std::io::Error,
+        source: io::Error,
     },
     #[error("provider command is not a read-only probe: {0}")]
     EffectfulCommand(String),

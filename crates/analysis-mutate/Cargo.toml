@@ -10,6 +10,7 @@ description = "Safe, language-neutral mutation execution for reporigor"
 
 [dependencies]
 base64.workspace = true
+ctrlc.workspace = true
 reporigor-core = { path = "../reporigor-core", version = "0.1.0" }
 reporigor-process-tree = { path = "../process-tree", version = "0.1.0" }
 fs2 = "0.4.3"

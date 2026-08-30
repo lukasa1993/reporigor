@@ -8,8 +8,8 @@ repository.workspace = true
 description = "Project and toolchain discovery adapters for reporigor"
 
 [dependencies]
+provider-mutation = { path = "../provider-mutation", version = "0.1.0" }
 reporigor-core = { path = "../reporigor-core", version = "0.1.0" }
-reporigor-process-tree = { path = "../process-tree", version = "0.1.0" }
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true

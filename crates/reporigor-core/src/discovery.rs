@@ -1,34 +1,20 @@
 use std::collections::BTreeSet;
 use std::fs::{self, File};
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 
+use crate::bounded_file::{canonical_directory, optional_symlink_metadata};
+use crate::path_io::CoreIoResult;
 use crate::{
     read_optional_bounded_utf8_file_within, AnalysisRequest, CoreError, Diagnostic, Language, ProjectContext,
     ProjectKind, Severity, SourceBudget, SourceFile,
 };
 
-const EXCLUDED_DIRS: &[&str] = &[
-    ".git",
-    ".hg",
-    ".idea",
-    ".pytest_cache",
-    ".tox",
-    ".venv",
-    ".build",
-    "build",
-    "coverage",
-    "dist",
-    "node_modules",
-    "target",
-    "vendor",
-    "venv",
-    "DerivedData",
-    "Pods",
-];
+const EXCLUDED_DIRS: &str =
+    ".git|.hg|.idea|.pytest_cache|.tox|.venv|.build|build|coverage|dist|node_modules|target|vendor|venv|DerivedData|Pods";
 const SHEBANG_PREFIX_BYTES: u64 = 4 * 1024;
 const IGNORE_FILE_MAX_BYTES: u64 = 256 * 1024;
 const IGNORE_FILE_MAX_LINES: usize = 8 * 1024;
@@ -81,6 +67,17 @@ struct TraversalBudget {
     directories: usize,
 }
 
+fn reject_unsafe_path(condition: bool, path: &Path, message: impl Into<String>) -> Result<(), CoreError> {
+    if condition {
+        Err(CoreError::UnsafePath {
+            path: path.display().to_string(),
+            message: message.into(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
 impl TraversalBudget {
     fn observe_entry(&mut self, directory: &Path, directory_entries: usize) -> Result<(), CoreError> {
         if directory_entries > DISCOVERY_MAX_DIRECTORY_ENTRIES {
@@ -129,28 +126,32 @@ struct DirectoryTask {
 #[must_use]
 pub fn discover_project(root: &Path) -> BTreeSet<ProjectKind> {
     let mut kinds = BTreeSet::new();
-    if root.join("Cargo.toml").is_file() {
-        kinds.insert(ProjectKind::Cargo);
-    }
-    if root.join("compile_commands.json").is_file() || root.join("build/compile_commands.json").is_file() {
-        kinds.insert(ProjectKind::CompilationDatabase);
-    }
-    if root.join("tsconfig.json").is_file() || root.join("package.json").is_file() {
-        kinds.insert(ProjectKind::TypeScript);
-    }
-    if root.join("Package.swift").is_file() {
-        kinds.insert(ProjectKind::SwiftPackage);
-    }
-    if ["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"]
-        .iter()
-        .any(|name| root.join(name).is_file())
-    {
-        kinds.insert(ProjectKind::Python);
+    let markers: &[(ProjectKind, &[&str])] = &[
+        (ProjectKind::Cargo, &["Cargo.toml"]),
+        (
+            ProjectKind::CompilationDatabase,
+            &["compile_commands.json", "build/compile_commands.json"],
+        ),
+        (ProjectKind::TypeScript, &["tsconfig.json", "package.json"]),
+        (ProjectKind::SwiftPackage, &["Package.swift"]),
+        (
+            ProjectKind::Python,
+            &["pyproject.toml", "setup.py", "setup.cfg", "requirements.txt"],
+        ),
+    ];
+    for (kind, candidates) in markers {
+        if has_project_marker(root, candidates) {
+            kinds.insert(*kind);
+        }
     }
     if kinds.is_empty() {
         kinds.insert(ProjectKind::Generic);
     }
     kinds
+}
+
+fn has_project_marker(root: &Path, candidates: &[&str]) -> bool {
+    candidates.iter().any(|name| root.join(name).is_file())
 }
 
 /// Discover supported source files under a project root.
@@ -160,183 +161,277 @@ pub fn discover_project(root: &Path) -> BTreeSet<ProjectKind> {
 /// Returns an error when `root` is not a directory or filesystem traversal
 /// fails.
 pub fn discover_sources(root: &Path, options: &DiscoveryOptions) -> Result<Vec<SourceFile>, CoreError> {
-    let canonical_root = canonical_discovery_root(root)?;
-    let root = canonical_root.as_path();
-    let mut sources = Vec::new();
-    let mut source_budget = SourceBudget::new(options.max_source_bytes)?;
-    let mut ignore_budget = IgnoreBudget::default();
-    let mut traversal_budget = TraversalBudget::default();
-    traversal_budget.register_directory(root, 0)?;
-    let mut pending = vec![DirectoryTask {
-        path: root.to_path_buf(),
-        depth: 0,
-        matchers: IgnoreMatchers::default(),
-    }];
+    let canonical_root = canonical_directory(root)?;
+    DiscoveryState::new(&canonical_root, options)?.run()
+}
 
-    while let Some(task) = pending.pop() {
-        validate_directory_within(root, &task.path)?;
-        let mut matchers = task.matchers;
-        load_directory_ignores(root, &task.path, &mut matchers, &mut ignore_budget)?;
+struct DiscoveryState<'a> {
+    root: &'a Path,
+    options: &'a DiscoveryOptions,
+    sources: Vec<SourceFile>,
+    source_budget: SourceBudget,
+    ignore_budget: IgnoreBudget,
+    traversal_budget: TraversalBudget,
+    pending: Vec<DirectoryTask>,
+}
 
-        let mut directories = Vec::new();
-        for entry in read_directory(&task.path, &mut traversal_budget)? {
-            let path = entry.path();
-            let file_type = entry.file_type().map_err(|source| CoreError::Read {
-                path: path.display().to_string(),
-                source,
-            })?;
-            let Ok(relative_path) = path.strip_prefix(root) else {
-                continue;
-            };
-            if is_excluded_path(relative_path) {
-                continue;
-            }
-            let is_directory = file_type.is_dir();
-            if is_ignored(&matchers, &path, is_directory) {
-                continue;
-            }
-            if is_directory {
-                let depth = task.depth.saturating_add(1);
-                traversal_budget.register_directory(&path, depth)?;
-                directories.push((path, depth));
-                continue;
-            }
-            // Match WalkBuilder's default no-follow behavior. Known ignore
-            // files were already inspected with the stricter bounded reader.
-            if !file_type.is_file() {
-                continue;
-            }
+struct InspectedEntry {
+    path: PathBuf,
+    relative: PathBuf,
+    file_type: fs::FileType,
+}
 
-            let (canonical_path, source_bytes) = validate_regular_file_within(root, &path)?;
-            let language = canonical_path
-                .extension()
-                .and_then(|extension| extension.to_str())
-                .and_then(|extension| language_from_extension(extension, &options.languages))
-                .or_else(|| detect_shebang_language(&canonical_path));
-            let Some(language) = language else {
-                continue;
-            };
-            if !options.languages.is_empty() && !options.languages.contains(&language) {
-                continue;
-            }
-            let relative = relative_path
-                .to_str()
-                .ok_or_else(|| non_utf8_source_path_error(relative_path))?
-                .replace('\\', "/");
-            if !options.filters.is_empty() && !options.filters.iter().any(|item| relative.contains(item)) {
-                continue;
-            }
-            let test = language.is_test_path(&relative);
-            if test && !options.include_tests {
-                continue;
-            }
-            source_budget.observe(&canonical_path, source_bytes)?;
-            let generated = is_generated_path(relative_path);
-            sources.push(SourceFile {
-                path: canonical_path,
-                relative,
-                language,
-                generated,
-                test,
-            });
+struct SelectedSource {
+    relative: String,
+    language: Language,
+    generated: bool,
+    test: bool,
+}
+
+impl<'a> DiscoveryState<'a> {
+    fn new(root: &'a Path, options: &'a DiscoveryOptions) -> Result<Self, CoreError> {
+        let source_budget = SourceBudget::new(options.max_source_bytes)?;
+        let mut traversal_budget = TraversalBudget::default();
+        traversal_budget.register_directory(root, 0)?;
+        Ok(Self {
+            root,
+            options,
+            sources: Vec::new(),
+            source_budget,
+            ignore_budget: IgnoreBudget::default(),
+            traversal_budget,
+            pending: vec![DirectoryTask {
+                path: root.to_path_buf(),
+                depth: 0,
+                matchers: IgnoreMatchers::default(),
+            }],
+        })
+    }
+
+    fn run(mut self) -> Result<Vec<SourceFile>, CoreError> {
+        while let Some(task) = self.pending.pop() {
+            self.process_directory(task)?;
         }
+        self.sources
+            .sort_by(|left, right| left.relative.cmp(&right.relative));
+        Ok(self.sources)
+    }
 
+    fn process_directory(&mut self, task: DirectoryTask) -> Result<(), CoreError> {
+        let (matchers, directories) = self.collect_directory(task)?;
+        self.enqueue_directories(directories, &matchers);
+        Ok(())
+    }
+
+    fn collect_directory(
+        &mut self,
+        task: DirectoryTask,
+    ) -> Result<(IgnoreMatchers, Vec<(PathBuf, usize)>), CoreError> {
+        validate_directory_within(self.root, &task.path)?;
+        let mut matchers = task.matchers;
+        load_directory_ignores(self.root, &task.path, &mut matchers, &mut self.ignore_budget)?;
+        let entries = read_directory(&task.path, &mut self.traversal_budget)?;
+        let mut directories = Vec::new();
+        for entry in entries {
+            self.process_entry(&entry, task.depth, &matchers, &mut directories)?;
+        }
+        Ok((matchers, directories))
+    }
+
+    fn enqueue_directories(&mut self, directories: Vec<(PathBuf, usize)>, matchers: &IgnoreMatchers) {
         for (path, depth) in directories.into_iter().rev() {
-            pending.push(DirectoryTask {
+            self.pending.push(DirectoryTask {
                 path,
                 depth,
                 matchers: matchers.clone(),
             });
         }
     }
-    sources.sort_by(|left, right| left.relative.cmp(&right.relative));
-    Ok(sources)
+
+    fn process_entry(
+        &mut self,
+        entry: &fs::DirEntry,
+        parent_depth: usize,
+        matchers: &IgnoreMatchers,
+        directories: &mut Vec<(PathBuf, usize)>,
+    ) -> Result<(), CoreError> {
+        let Some(entry) = inspect_entry(self.root, entry)? else {
+            return Ok(());
+        };
+        if should_skip_entry(&entry, matchers) {
+            return Ok(());
+        }
+        self.process_selected_entry(entry, parent_depth, directories)
+    }
+
+    fn process_selected_entry(
+        &mut self,
+        entry: InspectedEntry,
+        parent_depth: usize,
+        directories: &mut Vec<(PathBuf, usize)>,
+    ) -> Result<(), CoreError> {
+        if entry.file_type.is_dir() {
+            let depth = parent_depth.saturating_add(1);
+            self.traversal_budget.register_directory(&entry.path, depth)?;
+            directories.push((entry.path, depth));
+            return Ok(());
+        }
+        if entry.file_type.is_file() {
+            self.process_source_file(&entry)?;
+        }
+        Ok(())
+    }
+
+    fn process_source_file(&mut self, entry: &InspectedEntry) -> Result<(), CoreError> {
+        let (canonical_path, source_bytes) = validate_regular_file_within(self.root, &entry.path)?;
+        let Some(selected) = selected_source(&canonical_path, &entry.relative, self.options)? else {
+            return Ok(());
+        };
+        self.source_budget.observe(&canonical_path, source_bytes)?;
+        self.sources.push(SourceFile {
+            path: canonical_path,
+            relative: selected.relative,
+            language: selected.language,
+            generated: selected.generated,
+            test: selected.test,
+        });
+        Ok(())
+    }
 }
 
-fn canonical_discovery_root(root: &Path) -> Result<PathBuf, CoreError> {
-    let canonical = root.canonicalize().map_err(|source| CoreError::Read {
-        path: root.display().to_string(),
-        source,
-    })?;
-    if !fs::metadata(&canonical)
-        .map_err(|source| CoreError::Read {
-            path: root.display().to_string(),
-            source,
-        })?
-        .is_dir()
-    {
-        return Err(CoreError::InvalidRoot {
-            path: root.display().to_string(),
-            message: "not a directory".to_string(),
-        });
+fn inspect_entry(root: &Path, entry: &fs::DirEntry) -> Result<Option<InspectedEntry>, CoreError> {
+    let path = entry.path();
+    let file_type = entry.file_type().for_read_path(&path)?;
+    let relative = match path.strip_prefix(root) {
+        Ok(relative) => relative.to_path_buf(),
+        Err(_) => return Ok(None),
+    };
+    Ok(Some(InspectedEntry {
+        path,
+        relative,
+        file_type,
+    }))
+}
+
+fn should_skip_entry(entry: &InspectedEntry, matchers: &IgnoreMatchers) -> bool {
+    is_excluded_path(&entry.relative) || is_ignored(matchers, &entry.path, entry.file_type.is_dir())
+}
+
+fn selected_source(
+    canonical_path: &Path,
+    relative_path: &Path,
+    options: &DiscoveryOptions,
+) -> Result<Option<SelectedSource>, CoreError> {
+    let Some(language) = source_language(canonical_path, &options.languages) else {
+        return Ok(None);
+    };
+    let relative = relative_path
+        .to_str()
+        .ok_or_else(|| non_utf8_source_path_error(relative_path))?
+        .replace('\\', "/");
+    let test = language.is_test_path(&relative);
+    if !source_is_selected(options, language, &relative, test) {
+        return Ok(None);
     }
-    Ok(canonical)
+    Ok(Some(SelectedSource {
+        relative,
+        language,
+        generated: is_generated_path(relative_path),
+        test,
+    }))
+}
+
+fn source_language(path: &Path, requested: &BTreeSet<Language>) -> Option<Language> {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .and_then(|extension| language_from_extension(extension, requested))
+        .or_else(|| detect_shebang_language(path))
+}
+
+fn source_is_selected(options: &DiscoveryOptions, language: Language, relative: &str, test: bool) -> bool {
+    language_is_selected(&options.languages, language)
+        && filters_select(&options.filters, relative)
+        && (!test || options.include_tests)
+}
+
+fn language_is_selected(requested: &BTreeSet<Language>, language: Language) -> bool {
+    requested.is_empty() || requested.contains(&language)
+}
+
+fn filters_select(filters: &[String], relative: &str) -> bool {
+    filters.is_empty() || filters.iter().any(|item| relative.contains(item))
 }
 
 fn validate_directory_within(root: &Path, path: &Path) -> Result<(), CoreError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| CoreError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
-        return Err(CoreError::UnsafePath {
-            path: path.display().to_string(),
-            message: "expected a non-symlink directory during source discovery".to_string(),
-        });
-    }
+    validate_path_metadata(path, DiscoveryEntryKind::Directory)?;
     let canonical = canonical_path_within(root, path)?;
-    if canonical != path {
-        return Err(CoreError::UnsafePath {
-            path: path.display().to_string(),
-            message: format!(
-                "directory resolves through an unexpected alias to {}",
-                canonical.display()
-            ),
-        });
-    }
-    Ok(())
+    validate_directory_alias(path, &canonical)
+}
+
+fn validate_directory_alias(path: &Path, canonical: &Path) -> Result<(), CoreError> {
+    reject_unsafe_path(
+        canonical != path,
+        path,
+        format!(
+            "directory resolves through an unexpected alias to {}",
+            canonical.display()
+        ),
+    )
 }
 
 fn validate_regular_file_within(root: &Path, path: &Path) -> Result<(PathBuf, u64), CoreError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| CoreError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(CoreError::UnsafePath {
-            path: path.display().to_string(),
-            message: "expected a non-symlink regular source file".to_string(),
-        });
-    }
+    validate_path_metadata(path, DiscoveryEntryKind::Source)?;
     let canonical = canonical_path_within(root, path)?;
-    let opened_metadata = fs::metadata(&canonical).map_err(|source| CoreError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    if !opened_metadata.is_file() {
-        return Err(CoreError::UnsafePath {
-            path: path.display().to_string(),
-            message: "source path no longer resolves to a regular file".to_string(),
-        });
-    }
+    let opened_metadata = fs::metadata(&canonical).for_read_path(path)?;
+    validate_opened_source_metadata(path, &opened_metadata)?;
     Ok((canonical, opened_metadata.len()))
 }
 
+#[derive(Clone, Copy)]
+enum DiscoveryEntryKind {
+    Directory,
+    Source,
+}
+
+fn validate_path_metadata(path: &Path, kind: DiscoveryEntryKind) -> Result<(), CoreError> {
+    let metadata = fs::symlink_metadata(path).for_read_path(path)?;
+    validate_discovery_metadata(path, &metadata, kind)
+}
+
+fn validate_discovery_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+    kind: DiscoveryEntryKind,
+) -> Result<(), CoreError> {
+    let (valid, message) = match kind {
+        DiscoveryEntryKind::Directory => (
+            metadata.is_dir(),
+            "expected a non-symlink directory during source discovery",
+        ),
+        DiscoveryEntryKind::Source => (metadata.is_file(), "expected a non-symlink regular source file"),
+    };
+    reject_unsafe_path(metadata.file_type().is_symlink() || !valid, path, message)
+}
+
+fn validate_opened_source_metadata(path: &Path, metadata: &fs::Metadata) -> Result<(), CoreError> {
+    reject_unsafe_path(
+        !metadata.is_file(),
+        path,
+        "source path no longer resolves to a regular file",
+    )
+}
+
 fn canonical_path_within(root: &Path, path: &Path) -> Result<PathBuf, CoreError> {
-    let canonical = path.canonicalize().map_err(|source| CoreError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    if !canonical.starts_with(root) {
-        return Err(CoreError::UnsafePath {
-            path: path.display().to_string(),
-            message: format!(
-                "resolved path {} escapes project root {}",
-                canonical.display(),
-                root.display()
-            ),
-        });
-    }
+    let canonical = path.canonicalize().for_read_path(path)?;
+    reject_unsafe_path(
+        !canonical.starts_with(root),
+        path,
+        format!(
+            "resolved path {} escapes project root {}",
+            canonical.display(),
+            root.display()
+        ),
+    )?;
     Ok(canonical)
 }
 
@@ -349,16 +444,10 @@ fn non_utf8_source_path_error(relative: &Path) -> CoreError {
 }
 
 fn read_directory(path: &Path, budget: &mut TraversalBudget) -> Result<Vec<fs::DirEntry>, CoreError> {
-    let entries = fs::read_dir(path).map_err(|source| CoreError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
+    let entries = fs::read_dir(path).for_read_path(path)?;
     let mut output = Vec::new();
     for entry in entries {
-        let entry = entry.map_err(|source| CoreError::Read {
-            path: path.display().to_string(),
-            source,
-        })?;
+        let entry = entry.for_read_path(path)?;
         budget.observe_entry(path, output.len().saturating_add(1))?;
         output.push(entry);
     }
@@ -377,35 +466,61 @@ fn load_directory_ignores(
     // an analyzed checkout cannot safely authorize reads outside its root.
     let local_git_directory = has_local_git_directory(directory)?;
     let repository_boundary = directory == root || local_git_directory;
-    if repository_boundary && directory != root {
-        matchers.git_ignore.clear();
-        matchers.git_exclude = None;
-    }
+    reset_git_matchers_at_boundary(matchers, repository_boundary && directory != root);
+    update_git_exclude(root, directory, local_git_directory, matchers, budget)?;
+    push_ignore_matcher(
+        root,
+        &directory.join(".gitignore"),
+        directory,
+        budget,
+        &mut matchers.git_ignore,
+    )?;
+    push_ignore_matcher(
+        root,
+        &directory.join(".ignore"),
+        directory,
+        budget,
+        &mut matchers.dot_ignore,
+    )
+}
+
+fn update_git_exclude(
+    root: &Path,
+    directory: &Path,
+    local_git_directory: bool,
+    matchers: &mut IgnoreMatchers,
+    budget: &mut IgnoreBudget,
+) -> Result<(), CoreError> {
     if local_git_directory {
         matchers.git_exclude =
             load_ignore_file(root, &directory.join(".git/info/exclude"), directory, budget)?.map(Arc::new);
     }
-    if let Some(matcher) = load_ignore_file(root, &directory.join(".gitignore"), directory, budget)? {
-        matchers.git_ignore.push(Arc::new(matcher));
+    Ok(())
+}
+
+fn reset_git_matchers_at_boundary(matchers: &mut IgnoreMatchers, reset: bool) {
+    if reset {
+        matchers.git_ignore.clear();
+        matchers.git_exclude = None;
     }
-    // .ignore is a distinct higher-precedence class. A root .ignore match
-    // overrides even a nested .gitignore match, matching the ignore crate.
-    if let Some(matcher) = load_ignore_file(root, &directory.join(".ignore"), directory, budget)? {
-        matchers.dot_ignore.push(Arc::new(matcher));
+}
+
+fn push_ignore_matcher(
+    root: &Path,
+    path: &Path,
+    matcher_root: &Path,
+    budget: &mut IgnoreBudget,
+    target: &mut Vec<Arc<Gitignore>>,
+) -> Result<(), CoreError> {
+    if let Some(matcher) = load_ignore_file(root, path, matcher_root, budget)? {
+        target.push(Arc::new(matcher));
     }
     Ok(())
 }
 
 fn has_local_git_directory(directory: &Path) -> Result<bool, CoreError> {
     let path = directory.join(".git");
-    match fs::symlink_metadata(&path) {
-        Ok(metadata) => Ok(metadata.file_type().is_dir()),
-        Err(source) if source.kind() == ErrorKind::NotFound => Ok(false),
-        Err(source) => Err(CoreError::Read {
-            path: path.display().to_string(),
-            source,
-        }),
-    }
+    Ok(optional_symlink_metadata(&path)?.is_some_and(|metadata| metadata.file_type().is_dir()))
 }
 
 fn load_ignore_file(
@@ -418,10 +533,7 @@ fn load_ignore_file(
     if add_ignore_file(root, path, &mut builder, budget)? == 0 {
         return Ok(None);
     }
-    builder.build().map(Some).map_err(|error| CoreError::Parse {
-        path: path.display().to_string(),
-        message: format!("failed to compile bounded ignore patterns: {error}"),
-    })
+    map_ignore_builder_error(path, "failed to compile bounded ignore patterns", builder.build()).map(Some)
 }
 
 fn add_ignore_file(
@@ -433,8 +545,22 @@ fn add_ignore_file(
     let Some(contents) = read_optional_bounded_utf8_file_within(root, path, IGNORE_FILE_MAX_BYTES)? else {
         return Ok(0);
     };
+    observe_ignore_file_budget(path, contents.len(), budget)?;
+    let mut patterns = 0;
+    for (index, line) in contents.lines().enumerate() {
+        add_ignore_line(
+            path,
+            line,
+            index.saturating_add(1),
+            builder,
+            budget,
+            &mut patterns,
+        )?;
+    }
+    Ok(patterns)
+}
 
-    let bytes = contents.len();
+fn observe_ignore_file_budget(path: &Path, bytes: usize, budget: &mut IgnoreBudget) -> Result<(), CoreError> {
     let next_files = budget.files.saturating_add(1);
     let next_bytes = budget.bytes.saturating_add(bytes);
     if next_files > IGNORE_PROJECT_MAX_FILES || next_bytes > IGNORE_PROJECT_MAX_BYTES {
@@ -447,47 +573,71 @@ fn add_ignore_file(
     }
     budget.files = next_files;
     budget.bytes = next_bytes;
+    Ok(())
+}
 
-    let mut patterns: usize = 0;
-    for (index, line) in contents.lines().enumerate() {
-        let line_number = index.saturating_add(1);
-        if line_number > IGNORE_FILE_MAX_LINES {
-            return Err(ignore_parse_error(
-                path,
-                format!("ignore file exceeds {IGNORE_FILE_MAX_LINES} lines"),
-            ));
-        }
-        if line.len() > IGNORE_PATTERN_MAX_BYTES {
-            return Err(ignore_parse_error(
-                path,
-                format!("ignore line {line_number} exceeds {IGNORE_PATTERN_MAX_BYTES} bytes"),
-            ));
-        }
-        if is_ignore_pattern(line) {
-            patterns = patterns.saturating_add(1);
-            if patterns > IGNORE_FILE_MAX_PATTERNS {
-                return Err(ignore_parse_error(
-                    path,
-                    format!("ignore file exceeds {IGNORE_FILE_MAX_PATTERNS} patterns"),
-                ));
-            }
-            let next_patterns = budget.patterns.saturating_add(1);
-            if next_patterns > IGNORE_PROJECT_MAX_PATTERNS {
-                return Err(ignore_parse_error(
-                    path,
-                    format!("project ignore budget exceeds {IGNORE_PROJECT_MAX_PATTERNS} patterns"),
-                ));
-            }
-            budget.patterns = next_patterns;
-        }
-        builder
-            .add_line(Some(path.to_path_buf()), line)
-            .map_err(|error| CoreError::Parse {
-                path: path.display().to_string(),
-                message: format!("invalid ignore pattern on line {line_number}: {error}"),
-            })?;
+fn add_ignore_line(
+    path: &Path,
+    line: &str,
+    line_number: usize,
+    builder: &mut GitignoreBuilder,
+    budget: &mut IgnoreBudget,
+    patterns: &mut usize,
+) -> Result<(), CoreError> {
+    validate_ignore_line(path, line, line_number)?;
+    if is_ignore_pattern(line) {
+        observe_ignore_pattern(path, budget, patterns)?;
     }
-    Ok(patterns)
+    let context = format!("invalid ignore pattern on line {line_number}");
+    map_ignore_builder_error(path, &context, builder.add_line(Some(path.to_path_buf()), line))?;
+    Ok(())
+}
+
+fn map_ignore_builder_error<T>(
+    path: &Path,
+    context: &str,
+    result: Result<T, ignore::Error>,
+) -> Result<T, CoreError> {
+    result.map_err(|error| ignore_parse_error(path, format!("{context}: {error}")))
+}
+
+fn validate_ignore_line(path: &Path, line: &str, line_number: usize) -> Result<(), CoreError> {
+    if line_number > IGNORE_FILE_MAX_LINES {
+        return Err(ignore_parse_error(
+            path,
+            format!("ignore file exceeds {IGNORE_FILE_MAX_LINES} lines"),
+        ));
+    }
+    if line.len() > IGNORE_PATTERN_MAX_BYTES {
+        return Err(ignore_parse_error(
+            path,
+            format!("ignore line {line_number} exceeds {IGNORE_PATTERN_MAX_BYTES} bytes"),
+        ));
+    }
+    Ok(())
+}
+
+fn observe_ignore_pattern(
+    path: &Path,
+    budget: &mut IgnoreBudget,
+    patterns: &mut usize,
+) -> Result<(), CoreError> {
+    *patterns = patterns.saturating_add(1);
+    if *patterns > IGNORE_FILE_MAX_PATTERNS {
+        return Err(ignore_parse_error(
+            path,
+            format!("ignore file exceeds {IGNORE_FILE_MAX_PATTERNS} patterns"),
+        ));
+    }
+    let next_patterns = budget.patterns.saturating_add(1);
+    if next_patterns > IGNORE_PROJECT_MAX_PATTERNS {
+        return Err(ignore_parse_error(
+            path,
+            format!("project ignore budget exceeds {IGNORE_PROJECT_MAX_PATTERNS} patterns"),
+        ));
+    }
+    budget.patterns = next_patterns;
+    Ok(())
 }
 
 fn is_ignore_pattern(line: &str) -> bool {
@@ -546,9 +696,11 @@ fn match_ignore(matcher: &Gitignore, path: &Path, is_directory: bool) -> Option<
 }
 
 fn is_excluded_path(relative: &Path) -> bool {
-    relative
-        .components()
-        .any(|part| EXCLUDED_DIRS.iter().any(|excluded| part.as_os_str() == *excluded))
+    relative.components().any(|part| {
+        EXCLUDED_DIRS
+            .split('|')
+            .any(|excluded| part.as_os_str() == excluded)
+    })
 }
 
 fn language_from_extension(extension: &str, requested: &BTreeSet<Language>) -> Option<Language> {
@@ -566,11 +718,20 @@ fn language_from_extension(extension: &str, requested: &BTreeSet<Language>) -> O
 }
 
 fn detect_shebang_language(path: &Path) -> Option<Language> {
+    let prefix_bytes = shebang_prefix_length(path)?;
+    let bytes = read_shebang_prefix(path, prefix_bytes)?;
+    shell_shebang_language(&bytes)
+}
+
+fn shebang_prefix_length(path: &Path) -> Option<u64> {
     let metadata = fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() < 2 {
         return None;
     }
-    let prefix_bytes = metadata.len().min(SHEBANG_PREFIX_BYTES);
+    Some(metadata.len().min(SHEBANG_PREFIX_BYTES))
+}
+
+fn read_shebang_prefix(path: &Path, prefix_bytes: u64) -> Option<Vec<u8>> {
     let capacity = usize::try_from(prefix_bytes).ok()?;
     let mut bytes = Vec::with_capacity(capacity);
     File::open(path)
@@ -578,15 +739,18 @@ fn detect_shebang_language(path: &Path) -> Option<Language> {
         .take(prefix_bytes)
         .read_to_end(&mut bytes)
         .ok()?;
+    Some(bytes)
+}
+
+fn shell_shebang_language(bytes: &[u8]) -> Option<Language> {
     let first_line = bytes.split(|byte| *byte == b'\n').next()?;
-    if first_line.starts_with(b"#!")
+    is_shell_shebang(first_line).then_some(Language::Bash)
+}
+
+fn is_shell_shebang(first_line: &[u8]) -> bool {
+    first_line.starts_with(b"#!")
         && (first_line.windows(4).any(|window| window == b"bash")
             || first_line.windows(3).any(|window| window == b"/sh"))
-    {
-        Some(Language::Bash)
-    } else {
-        None
-    }
 }
 
 fn is_generated_path(relative: &Path) -> bool {
@@ -606,10 +770,7 @@ impl ProjectContext {
     /// Returns an error when the root cannot be canonicalized or source
     /// discovery fails.
     pub fn discover(request: &AnalysisRequest) -> Result<Self, CoreError> {
-        let canonical = request.root.canonicalize().map_err(|source| CoreError::Read {
-            path: request.root.display().to_string(),
-            source,
-        })?;
+        let canonical = canonical_directory(&request.root)?;
         let sources = discover_sources(
             &canonical,
             &DiscoveryOptions {
@@ -620,13 +781,11 @@ impl ProjectContext {
             },
         )?;
         let diagnostics = if sources.is_empty() {
-            vec![Diagnostic {
-                severity: Severity::Warning,
-                backend: "discovery".to_string(),
-                message: "no supported source files discovered".to_string(),
-                location: None,
-                fallback_used: false,
-            }]
+            vec![Diagnostic::new(
+                Severity::Warning,
+                "discovery",
+                "no supported source files discovered",
+            )]
         } else {
             Vec::new()
         };
@@ -640,12 +799,14 @@ impl ProjectContext {
     }
 }
 
-#[allow(dead_code)]
-fn _assert_pathbuf_send_sync(_: PathBuf) {}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(unix)]
+    use std::{
+        ffi::OsString,
+        os::unix::{ffi::OsStringExt, fs::symlink},
+    };
 
     use super::*;
 
@@ -656,12 +817,200 @@ mod tests {
         }
     }
 
+    fn discovery_error(root: &Path) -> CoreError {
+        expect_core_error(discover_sources(root, &DiscoveryOptions::default()))
+    }
+
+    fn write_fixture_files(root: &Path, files: &[(&str, &str)]) -> Result<(), Box<dyn std::error::Error>> {
+        for (relative, contents) in files {
+            fs::write(root.join(relative), contents)?;
+        }
+        Ok(())
+    }
+
+    fn populated_fixture(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let fixture = tempfile::tempdir().unwrap_or_else(|error| panic!("fixture: {error}"));
+        for (relative, contents) in files {
+            let path = fixture.path().join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).unwrap_or_else(|error| panic!("fixture directory: {error}"));
+            }
+            fs::write(path, contents).unwrap_or_else(|error| panic!("write fixture: {error}"));
+        }
+        fixture
+    }
+
+    fn discovered_fixture_sources(root: &Path) -> Vec<SourceFile> {
+        discover_sources(root, &DiscoveryOptions::default())
+            .unwrap_or_else(|error| panic!("discover fixture: {error}"))
+    }
+
+    fn assert_single_source(root: &Path, expected: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let sources = discover_sources(root, &DiscoveryOptions::default())?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].relative, expected);
+        Ok(())
+    }
+
+    fn write_repository_fixture(
+        root: &Path,
+        directories: &str,
+        rules: &[(&str, &str)],
+        sources: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        for relative in directories.split('|') {
+            fs::create_dir_all(root.join(relative))?;
+        }
+        write_fixture_files(root, rules)?;
+        for relative in sources.split('|') {
+            fs::write(root.join(relative), "value = 1\n")?;
+        }
+        Ok(())
+    }
+
+    #[derive(Clone, Copy)]
+    enum RepositoryFixtureCase {
+        IgnorePrecedence,
+        NestedRepository,
+    }
+
+    fn repository_fixture(
+        case: RepositoryFixtureCase,
+    ) -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+        let directories = match case {
+            RepositoryFixtureCase::IgnorePrecedence => ".git/info|nested|ignored-dir",
+            RepositoryFixtureCase::NestedRepository => "nested/.git",
+        };
+        let sources = match case {
+            RepositoryFixtureCase::IgnorePrecedence => {
+                "drop.py|keep.py|from-exclude.py|from-ignore.py|nested/drop.py|nested/nested-keep.py|nested/root-ignore-wins.py|ignored-dir/resurrect.py"
+            }
+            RepositoryFixtureCase::NestedRepository => "root.py|nested/selected.py|nested/custom.py",
+        };
+        let rules: &[(&str, &str)] = match case {
+            RepositoryFixtureCase::IgnorePrecedence => &[
+                (".git/info/exclude", "from-exclude.py\n"),
+                (".gitignore", "*.py\n!keep.py\n!from-exclude.py\nignored-dir/\n"),
+                (".ignore", "!from-ignore.py\nnested/root-ignore-wins.py\n"),
+                ("nested/.gitignore", "!nested-keep.py\n!root-ignore-wins.py\n"),
+            ],
+            RepositoryFixtureCase::NestedRepository => {
+                &[(".gitignore", "*.py\n"), (".ignore", "nested/custom.py\n")]
+            }
+        };
+        let fixture = tempfile::tempdir()?;
+        write_repository_fixture(fixture.path(), directories, rules, sources)?;
+        Ok(fixture)
+    }
+
+    #[cfg(unix)]
+    fn write_non_utf8_named_source(
+        root: &Path,
+        filename: &std::ffi::OsString,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        match fs::write(root.join(filename), "value = 1\n") {
+            Ok(()) => Ok(true),
+            Err(error) if error.raw_os_error() == Some(libc::EILSEQ) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(unix)]
+    fn assert_non_utf8_directory_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        populated_non_utf8_directory().map(|fixture| {
+            let error = discovery_error(fixture.path());
+            assert!(matches!(error, CoreError::UnsafePath { .. }));
+        })
+    }
+
+    #[cfg(unix)]
+    fn populated_non_utf8_directory() -> Result<tempfile::TempDir, Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        populate_non_utf8_directory(fixture.path()).map(|()| fixture)
+    }
+
+    #[cfg(unix)]
+    fn populate_non_utf8_directory(root: &Path) -> Result<(), Box<dyn std::error::Error>> {
+        let dirname = std::ffi::OsString::from_vec(b"package-\xff".to_vec());
+        let directory = root.join(dirname);
+        fs::create_dir(&directory)?;
+        fs::write(directory.join("source.py"), "value = 1\n")
+            .map_err(|error| Box::new(error) as Box<dyn std::error::Error>)
+    }
+
+    #[cfg(unix)]
+    fn create_directory_symlink_fixture(
+        root: &Path,
+        outside: &Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        fs::write(root.join("inside.py"), "value = 1\n")?;
+        fs::write(outside.join("outside.py"), "value = 1\n")?;
+        symlink(outside, root.join("linked"))?;
+        Ok(())
+    }
+
+    fn assert_sparse_ignore_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        let sparse = tempfile::tempdir()?;
+        File::create(sparse.path().join(".gitignore"))?.set_len(IGNORE_FILE_MAX_BYTES + 1)?;
+        assert!(matches!(
+            discover_sources(sparse.path(), &DiscoveryOptions::default()),
+            Err(CoreError::FileTooLarge { .. })
+        ));
+        Ok(())
+    }
+
+    fn assert_invalid_ignore(contents: String, expected: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = tempfile::tempdir()?;
+        fs::write(fixture.path().join(".gitignore"), contents)?;
+        let error = discovery_error(fixture.path());
+        assert!(error.to_string().contains(expected));
+        Ok(())
+    }
+
+    fn assert_excessive_ignore_lines_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        assert_invalid_ignore("\n".repeat(IGNORE_FILE_MAX_LINES + 1), "exceeds 8192 lines")
+    }
+
+    fn assert_excessive_ignore_patterns_rejected() -> Result<(), Box<dyn std::error::Error>> {
+        assert_invalid_ignore(
+            "ignored\n".repeat(IGNORE_FILE_MAX_PATTERNS + 1),
+            "exceeds 4096 patterns",
+        )
+    }
+
     #[test]
     fn language_detection_handles_all_supported_extensions() {
         assert_eq!(Language::from_extension("py"), Some(Language::Python));
         assert_eq!(Language::from_extension("tsx"), Some(Language::TypeScript));
         assert_eq!(Language::from_extension("mm"), Some(Language::ObjectiveC));
         assert_eq!(Language::from_extension("unknown"), None);
+    }
+
+    #[test]
+    fn project_context_reports_empty_roots_and_discovers_populated_projects() {
+        let fixture = tempfile::tempdir().unwrap_or_else(|error| panic!("fixture: {error}"));
+        let request = AnalysisRequest::new(fixture.path().to_path_buf());
+        let empty = ProjectContext::discover(&request)
+            .unwrap_or_else(|error| panic!("empty context discovery: {error}"));
+        assert!(empty.sources.is_empty());
+        assert_eq!(empty.diagnostics.len(), 1);
+        assert!(empty.kinds.contains(&ProjectKind::Generic));
+
+        write_fixture_files(
+            fixture.path(),
+            &[(
+                "Cargo.toml",
+                "[package]\nname = \"fixture\"\nversion = \"0.1.0\"\n",
+            )],
+        )
+        .unwrap_or_else(|error| panic!("manifest fixture: {error}"));
+        write_fixture_files(fixture.path(), &[("lib.rs", "pub fn run() {}\n")])
+            .unwrap_or_else(|error| panic!("source fixture: {error}"));
+        let populated = ProjectContext::discover(&request)
+            .unwrap_or_else(|error| panic!("populated context discovery: {error}"));
+        assert_eq!(populated.sources.len(), 1);
+        assert!(populated.diagnostics.is_empty());
+        assert!(populated.kinds.contains(&ProjectKind::Cargo));
     }
 
     #[test]
@@ -695,15 +1044,11 @@ mod tests {
 
     #[test]
     fn explicit_cpp_and_objective_c_discovery_include_headers() {
-        let temp = std::env::temp_dir().join(format!("reporigor-header-discovery-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(&temp).unwrap_or_else(|error| panic!("create fixture: {error}"));
-        fs::write(temp.join("shared.h"), "int shared(void);\n")
-            .unwrap_or_else(|error| panic!("write fixture: {error}"));
+        let temp = populated_fixture(&[("shared.h", "int shared(void);\n")]);
 
         for language in [Language::Cpp, Language::ObjectiveC] {
             let files = discover_sources(
-                &temp,
+                temp.path(),
                 &DiscoveryOptions {
                     languages: BTreeSet::from([language]),
                     ..DiscoveryOptions::default()
@@ -714,23 +1059,17 @@ mod tests {
             assert_eq!(files[0].language, language);
             assert_eq!(files[0].relative, "shared.h");
         }
-        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
     fn discovers_extensionless_bash_and_skips_tests() {
-        let temp = std::env::temp_dir().join(format!("reporigor-discovery-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(temp.join("tests")).unwrap_or_else(|error| panic!("create fixture: {error}"));
-        fs::write(temp.join("tool"), "#!/usr/bin/env bash\necho ok\n")
-            .unwrap_or_else(|error| panic!("write fixture: {error}"));
-        fs::write(temp.join("tests/test_tool.sh"), "echo test\n")
-            .unwrap_or_else(|error| panic!("write fixture: {error}"));
-        let files = discover_sources(&temp, &DiscoveryOptions::default())
-            .unwrap_or_else(|error| panic!("discover fixture: {error}"));
+        let temp = populated_fixture(&[
+            ("tool", "#!/usr/bin/env bash\necho ok\n"),
+            ("tests/test_tool.sh", "echo test\n"),
+        ]);
+        let files = discovered_fixture_sources(temp.path());
         assert_eq!(files.len(), 1);
         assert_eq!(files[0].language, Language::Bash);
-        let _ = fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -739,13 +1078,8 @@ mod tests {
 
         use std::io::Write;
 
-        let temp = std::env::temp_dir().join(format!(
-            "reporigor-sparse-shebang-discovery-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&temp);
-        fs::create_dir_all(&temp)?;
-        let path = temp.join("huge-tool");
+        let temp = tempfile::tempdir()?;
+        let path = temp.path().join("huge-tool");
         let mut file = File::create(&path)?;
         file.write_all(b"#!/usr/bin/env bash\n")?;
         file.set_len(SPARSE_FILE_BYTES)?;
@@ -753,7 +1087,7 @@ mod tests {
         assert_eq!(fs::metadata(&path)?.len(), SPARSE_FILE_BYTES);
 
         let result = discover_sources(
-            &temp,
+            temp.path(),
             &DiscoveryOptions {
                 languages: BTreeSet::from([Language::Bash]),
                 ..DiscoveryOptions::default()
@@ -761,7 +1095,6 @@ mod tests {
         );
 
         assert!(matches!(result, Err(CoreError::SourceTooLarge { .. })));
-        fs::remove_dir_all(temp)?;
         Ok(())
     }
 
@@ -795,39 +1128,11 @@ mod tests {
     }
 
     #[test]
-    fn bounded_ignore_rules_preserve_negation_depth_and_source_precedence(
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        fs::create_dir_all(temp.path().join(".git/info"))?;
-        fs::create_dir_all(temp.path().join("nested"))?;
-        fs::create_dir_all(temp.path().join("ignored-dir"))?;
-        fs::write(temp.path().join(".git/info/exclude"), "from-exclude.py\n")?;
-        fs::write(
-            temp.path().join(".gitignore"),
-            "*.py\n!keep.py\n!from-exclude.py\nignored-dir/\n",
-        )?;
-        fs::write(
-            temp.path().join(".ignore"),
-            "!from-ignore.py\nnested/root-ignore-wins.py\n",
-        )?;
-        fs::write(
-            temp.path().join("nested/.gitignore"),
-            "!nested-keep.py\n!root-ignore-wins.py\n",
-        )?;
-        for path in [
-            "drop.py",
-            "keep.py",
-            "from-exclude.py",
-            "from-ignore.py",
-            "nested/drop.py",
-            "nested/nested-keep.py",
-            "nested/root-ignore-wins.py",
-            "ignored-dir/resurrect.py",
-        ] {
-            fs::write(temp.path().join(path), "value = 1\n")?;
-        }
+    fn bounded_ignore_rules_preserve_negation_depth_and_source_precedence() {
+        let temp = repository_fixture(RepositoryFixtureCase::IgnorePrecedence)
+            .unwrap_or_else(|error| panic!("ignore precedence fixture: {error}"));
 
-        let sources = discover_sources(temp.path(), &DiscoveryOptions::default())?;
+        let sources = discovered_fixture_sources(temp.path());
         let names = sources
             .iter()
             .map(|source| source.relative.as_str())
@@ -841,7 +1146,6 @@ mod tests {
                 "nested/nested-keep.py"
             ]
         );
-        Ok(())
     }
 
     #[test]
@@ -852,35 +1156,21 @@ mod tests {
         fs::write(parent.path().join(".gitignore"), "*.py\n")?;
         fs::write(root.join("selected.py"), "value = 1\n")?;
 
-        let sources = discover_sources(&root, &DiscoveryOptions::default())?;
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].relative, "selected.py");
-        Ok(())
+        assert_single_source(&root, "selected.py")
     }
 
     #[test]
     fn nested_real_repository_resets_git_rules_but_not_custom_ignore_rules(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let temp = tempfile::tempdir()?;
-        fs::create_dir_all(temp.path().join("nested/.git"))?;
-        fs::write(temp.path().join(".gitignore"), "*.py\n")?;
-        fs::write(temp.path().join(".ignore"), "nested/custom.py\n")?;
-        fs::write(temp.path().join("root.py"), "value = 1\n")?;
-        fs::write(temp.path().join("nested/selected.py"), "value = 1\n")?;
-        fs::write(temp.path().join("nested/custom.py"), "value = 1\n")?;
+        let temp = repository_fixture(RepositoryFixtureCase::NestedRepository)?;
 
-        let sources = discover_sources(temp.path(), &DiscoveryOptions::default())?;
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].relative, "nested/selected.py");
-        Ok(())
+        assert_single_source(temp.path(), "nested/selected.py")
     }
 
     #[cfg(unix)]
     #[test]
     fn ignore_symlinks_to_devices_are_rejected_without_opening_them() -> Result<(), Box<dyn std::error::Error>>
     {
-        use std::os::unix::fs::symlink;
-
         for name in [".gitignore", ".ignore"] {
             let temp = tempfile::tempdir()?;
             symlink("/dev/zero", temp.path().join(name))?;
@@ -894,26 +1184,9 @@ mod tests {
     #[test]
     fn sparse_and_excessive_ignore_files_fail_before_unbounded_work() -> Result<(), Box<dyn std::error::Error>>
     {
-        let sparse = tempfile::tempdir()?;
-        File::create(sparse.path().join(".gitignore"))?.set_len(IGNORE_FILE_MAX_BYTES + 1)?;
-        assert!(matches!(
-            discover_sources(sparse.path(), &DiscoveryOptions::default()),
-            Err(CoreError::FileTooLarge { .. })
-        ));
-
-        let lines = tempfile::tempdir()?;
-        fs::write(
-            lines.path().join(".gitignore"),
-            "\n".repeat(IGNORE_FILE_MAX_LINES + 1),
-        )?;
-        let error = expect_core_error(discover_sources(lines.path(), &DiscoveryOptions::default()));
-        assert!(error.to_string().contains("exceeds 8192 lines"));
-
-        let patterns = tempfile::tempdir()?;
-        let contents = "ignored\n".repeat(IGNORE_FILE_MAX_PATTERNS + 1);
-        fs::write(patterns.path().join(".gitignore"), contents)?;
-        let error = expect_core_error(discover_sources(patterns.path(), &DiscoveryOptions::default()));
-        assert!(error.to_string().contains("exceeds 4096 patterns"));
+        assert_sparse_ignore_rejected()?;
+        assert_excessive_ignore_lines_rejected()?;
+        assert_excessive_ignore_patterns_rejected()?;
         Ok(())
     }
 
@@ -958,52 +1231,28 @@ mod tests {
     #[test]
     fn non_utf8_selected_file_and_directory_names_fail_without_lossy_aliases(
     ) -> Result<(), Box<dyn std::error::Error>> {
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-
         let bad_file = tempfile::tempdir()?;
         let filename = OsString::from_vec(b"source-\xff.py".to_vec());
         let raw_relative = PathBuf::from(filename.clone());
         assert!(non_utf8_source_path_error(&raw_relative)
             .to_string()
             .contains("not valid UTF-8"));
-        if let Err(error) = fs::write(bad_file.path().join(filename), "value = 1\n") {
-            if error.raw_os_error() == Some(libc::EILSEQ) {
-                eprintln!("filesystem rejects non-UTF-8 names; path-level regression still ran");
-                return Ok(());
-            }
-            return Err(error.into());
+        if !write_non_utf8_named_source(bad_file.path(), &filename)? {
+            eprintln!("filesystem rejects non-UTF-8 names; path-level regression still ran");
+            return Ok(());
         }
-        let error = expect_core_error(discover_sources(bad_file.path(), &DiscoveryOptions::default()));
+        let error = discovery_error(bad_file.path());
         assert!(matches!(error, CoreError::UnsafePath { .. }));
         assert!(error.to_string().contains("not valid UTF-8"));
-
-        let bad_directory = tempfile::tempdir()?;
-        let dirname = OsString::from_vec(b"package-\xff".to_vec());
-        let directory = bad_directory.path().join(dirname);
-        fs::create_dir(&directory)?;
-        fs::write(directory.join("source.py"), "value = 1\n")?;
-        let error = expect_core_error(discover_sources(
-            bad_directory.path(),
-            &DiscoveryOptions::default(),
-        ));
-        assert!(matches!(error, CoreError::UnsafePath { .. }));
-        Ok(())
+        assert_non_utf8_directory_rejected()
     }
 
     #[cfg(unix)]
     #[test]
     fn directory_symlinks_are_never_followed() -> Result<(), Box<dyn std::error::Error>> {
-        use std::os::unix::fs::symlink;
-
         let root = tempfile::tempdir()?;
         let outside = tempfile::tempdir()?;
-        fs::write(root.path().join("inside.py"), "value = 1\n")?;
-        fs::write(outside.path().join("outside.py"), "value = 1\n")?;
-        symlink(outside.path(), root.path().join("linked"))?;
-        let sources = discover_sources(root.path(), &DiscoveryOptions::default())?;
-        assert_eq!(sources.len(), 1);
-        assert_eq!(sources[0].relative, "inside.py");
-        Ok(())
+        create_directory_symlink_fixture(root.path(), outside.path())?;
+        assert_single_source(root.path(), "inside.py")
     }
 }

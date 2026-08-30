@@ -6,13 +6,18 @@ mod discovery;
 mod dry_budget;
 mod duration;
 mod model;
+mod path_io;
 mod source_budget;
+mod stable_id;
 
 pub use bounded_file::{
-    read_bounded_utf8_file, read_bounded_utf8_file_within, read_optional_bounded_utf8_file_within,
-    resolve_optional_regular_file_within, PROJECT_METADATA_MAX_BYTES,
+    canonical_directory, read_bounded_utf8_file, read_bounded_utf8_file_within,
+    read_optional_bounded_utf8_file_within, resolve_optional_regular_file_within, PROJECT_METADATA_MAX_BYTES,
 };
-pub use config::{CrapConfig, DryConfig, MutationConfig, RepoRigorConfig};
+pub use config::{
+    ArchitectureConfig, BaselineConfig, CohesionConfig, CrapConfig, DryConfig, KissConfig, MutationConfig,
+    MutationOperator, RepoRigorConfig, YagniConfig,
+};
 pub use discovery::{discover_project, discover_sources, DiscoveryOptions};
 pub use dry_budget::{
     validate_dry_work_limit, DRY_DEFAULT_MAX_CANDIDATE_WORK, DRY_DEFAULT_MAX_FINGERPRINT_BUCKETS,
@@ -21,14 +26,53 @@ pub use dry_budget::{
 };
 pub use duration::{checked_duration_from_secs_f64, InvalidDurationSeconds};
 pub use model::{
-    AnalysisRequest, AnalysisSnapshot, BackendCapabilities, BackendInfo, BackendPreference, Capability,
-    Diagnostic, FileAnalysis, FunctionRecord, Language, MutationCandidate, MutationResult, MutationStatus,
-    ProjectContext, ProjectKind, Severity, SourceFile, SourceLocation, TokenRecord,
+    canonicalize_rule_results, compare_function_records, validate_rule_results, AnalysisRequest,
+    AnalysisSnapshot, BackendCapabilities, BackendInfo, BackendPreference, BaselineDisposition, Capability,
+    CoverageSpan, DependencyRecord, DependencyScope, Diagnostic, FeatureRecord, FileAnalysis, FunctionRecord,
+    IdentifierCountRecord, Language, ModuleRecord, MutationCandidate, MutationResult, MutationStatus,
+    PackageRecord, ProjectContext, ProjectKind, RepositorySemantics, RuleComparison, RuleOutcome, RuleResult,
+    RuleResultInput, RuleSummary, Severity, SourceFile, SourceLocation, SymbolVisibility, TestRecord,
+    TokenRecord, TraitImplementationRecord, UnreachableRecord,
 };
+pub use path_io::is_executable_file;
 pub use source_budget::{
     validate_max_source_bytes, SourceBudget, MAX_SELECTED_SOURCE_BYTES, MAX_SELECTED_SOURCE_FILES,
     MAX_SOURCE_BYTES_HARD_LIMIT,
 };
+pub use stable_id::{is_lowercase_sha256, normalize_repository_path, stable_id};
+
+/// Convert a bounded in-memory count without truncating values representable by
+/// the analysis model.
+#[must_use]
+pub fn count_as_f64(value: usize) -> f64 {
+    f64::from(u32::try_from(value).unwrap_or(u32::MAX))
+}
+
+/// Construct one [`RuleResult`] without a high-arity function signature.
+#[macro_export]
+macro_rules! rule_result {
+    (
+        $rule_id:expr,
+        $file:expr,
+        $stable_symbol:expr,
+        $measured:expr,
+        $allowed:expr,
+        $algorithm:expr,
+        $comparison:expr,
+        $structural_evidence:expr $(,)?
+    ) => {
+        $crate::RuleResult::new($crate::RuleResultInput {
+            rule_id: ($rule_id).into(),
+            file: ($file).into(),
+            stable_symbol: ($stable_symbol).into(),
+            measured: $measured,
+            allowed: $allowed,
+            algorithm: ($algorithm).into(),
+            comparison: $comparison,
+            structural_evidence: ($structural_evidence).into(),
+        })
+    };
+}
 
 use std::path::Path;
 

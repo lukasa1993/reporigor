@@ -1,96 +1,158 @@
-# Portable packaging and release readiness
+# Local macOS and Linux releases
 
-## Immediate local package
+RepoRigor's public binaries are built, signed, notarized, verified, and
+published from the maintainer's Apple Silicon Mac. GitHub Actions has only an
+explicitly manual, read-only build-candidate check: version tags do not trigger
+it, and it has no signing credentials or release publication permission.
 
-On macOS or Linux, build and smoke-test a portable archive for the current
-machine without publishing anything:
+## Consumer install: no build or toolchain
 
-```sh
-scripts/package-local
-```
-
-The script writes `reporigor-<rust-target>.tar.gz` and its adjacent SHA-256
-file under `target/dist/`. The archive has the same top-level layout expected by
-`cargo-binstall`, contains one multicall executable plus 24 compatibility
-symlinks, includes the copy-ready agent prompt, and is extracted and
-smoke-tested before the command succeeds.
-
-Any machine with Rust 1.82 or newer can instead build and install directly:
+On macOS or Linux, download and run the small release installer:
 
 ```sh
-cargo install --locked --path crates/reporigor
+curl --proto '=https' --tlsv1.2 -fL \
+  https://github.com/lukasa1993/reporigor/releases/latest/download/install.sh \
+  -o /tmp/reporigor-install.sh
+sh /tmp/reporigor-install.sh
 ```
 
-## Cross-platform distribution plan
+The installer detects the OS and CPU, downloads the matching archive and
+adjacent checksum over HTTPS, verifies SHA-256 before extraction, and installs
+one executable plus all 24 compatibility symlinks under `~/.local/bin`. It uses
+the static musl archive on Linux for maximum portability. No Rust, Python,
+Node, JVM, or runtime grammar download is needed.
 
-[`../dist-workspace.toml`](../dist-workspace.toml) pins cargo-dist 0.32.0 and is
-the canonical machine-readable distribution plan. A validated plan includes
-shell and PowerShell installers, a Homebrew formula, an npm binary wrapper,
-SHA-256 checksums, source archives, and the following executable archives. The
-online channels remain inactive until publication is separately approved.
+Pin a version or choose another installation directory when reproducibility or
+PATH layout requires it:
 
-The `Release artifacts (build only)` GitHub Actions workflow builds release
-candidates without publishing them. It runs when a `v*` tag is pushed or when a
-maintainer starts it with `workflow_dispatch`. A tag run proceeds only when the
-tag is exactly `v` followed by the `reporigor` package version.
+```sh
+REPORIGOR_INSTALL_DIR="$HOME/bin" sh /tmp/reporigor-install.sh 0.1.0
+```
 
-Before building, the workflow checks formatting, compilation, Clippy, tests,
-documentation, dependency advisories, license allowlists, dependency bans, and
-dependency sources. The workflow has read-only repository permissions. It does
-not create a GitHub Release, push tags, or publish crates.
+## One-time local signing setup
 
-## Artifacts
+Public macOS command-line tools require a valid `Developer ID Application`
+certificate. `Apple Development`, ad-hoc, and Mac App Store distribution
+identities are not substitutes for public distribution. Install the Developer
+ID certificate and its private key in the login keychain. RepoRigor releases
+are locked to the Picktek Apple Developer team (`N43S8JF6JT`); the builder and
+publisher both reject a signature from any other team.
 
-Each run produces one archive and one adjacent `.sha256` checksum file for each
-supported target:
+Xcode's supported command-line provisioning path is
+`xcodebuild -allowProvisioningUpdates`. The Apple account configured in Xcode
+must have access to Picktek's cloud-managed Developer ID certificates; without
+that team permission Xcode can create development signatures but cannot obtain
+the public `Developer ID Application` identity.
 
-| Runner | Rust target | Archive |
+Store notarization credentials once in the local Keychain. An App Store Connect
+API key is preferred:
+
+```sh
+xcrun notarytool store-credentials reporigor-notary \
+  --key /secure/path/AuthKey_KEYID.p8 \
+  --key-id KEYID \
+  --issuer ISSUER_UUID
+```
+
+An Apple ID, team ID, and app-specific password also work; omitting `--password`
+uses a secure prompt:
+
+```sh
+xcrun notarytool store-credentials reporigor-notary \
+  --apple-id developer@example.com \
+  --team-id N43S8JF6JT
+```
+
+Nothing is copied into the repository or GitHub. Set
+`REPORIGOR_NOTARY_PROFILE` only if the stored profile has a different name. If
+more than one Developer ID identity is installed, set
+`REPORIGOR_APPLE_SIGNING_IDENTITY` to the exact identity string.
+
+## Build, sign, notarize, and verify locally
+
+Requirements are Apple Silicon macOS, Xcode command-line tools, Rustup, a
+running Docker Desktop, a clean Git worktree, the Developer ID identity, and
+the Keychain notarization profile. Then run:
+
+```sh
+scripts/release-local
+```
+
+The command performs the complete local release build:
+
+1. Cross-builds native Apple Silicon and Intel macOS executables with the pinned
+   Rust 1.95.0 toolchain.
+2. Signs each Mach-O with a secure timestamp and hardened runtime, verifies the
+   signature, submits it to Apple's notary service, and requires `Accepted`.
+3. Builds GNU and static musl Linux executables for ARM64 and x86-64 inside four
+   architecture-specific Docker images pinned by immutable digest.
+4. Packages one multicall executable, 24 compatibility symlinks, schemas,
+   configuration, documentation, license, and notices per target.
+5. Extracts every archive on the matching native, Rosetta, or Docker runtime
+   and runs `--version` through all 25 command names.
+6. Writes adjacent checksum files, an aggregate `SHA256SUMS`, notarization JSON,
+   and `BUILDINFO.txt` with the exact commit, toolchain, image digests, and
+   signing state.
+
+Final assets are written to `target/dist/v<version>/`. The source tree is mounted
+read-only in Linux builders, while Cargo registry and build caches stay under
+`target/` for faster later releases.
+
+`scripts/release-local --unsigned` exists only to validate builders on a machine
+without release credentials. The publisher refuses those artifacts.
+
+## Publish from this Mac
+
+After reviewing all assets, commit and push the exact source revision, then run:
+
+```sh
+scripts/publish-local-release
+```
+
+The publisher requires a clean checkout whose `HEAD` equals `origin/main`, a
+tag exactly matching the Cargo version, all six archives and checksums, signed
+Developer ID identities inside both macOS archives, accepted notarization
+records, and `BUILDINFO.txt` marked signed. It creates and pushes the annotated
+version tag, then creates the GitHub Release and uploads the local assets. It
+never invokes GitHub Actions.
+
+## Published targets
+
+| Platform | Rust target | Purpose |
 | --- | --- | --- |
-| Linux | `x86_64-unknown-linux-gnu` | `.tar.gz` |
-| Linux ARM64 | `aarch64-unknown-linux-gnu` | `.tar.gz` |
-| Linux static | `x86_64-unknown-linux-musl` | `.tar.gz` |
-| Linux ARM64 static | `aarch64-unknown-linux-musl` | `.tar.gz` |
-| macOS | `x86_64-apple-darwin` | `.tar.gz` |
-| macOS | `aarch64-apple-darwin` | `.tar.gz` |
-| Windows | `x86_64-pc-windows-msvc` | `.zip` |
+| macOS Apple Silicon | `aarch64-apple-darwin` | Native signed/notarized binary |
+| macOS Intel | `x86_64-apple-darwin` | Native signed/notarized binary |
+| Linux ARM64 static | `aarch64-unknown-linux-musl` | Default ARM64 installer asset |
+| Linux x86-64 static | `x86_64-unknown-linux-musl` | Default x86-64 installer asset |
+| Linux ARM64 GNU | `aarch64-unknown-linux-gnu` | Native glibc/cargo-binstall asset |
+| Linux x86-64 GNU | `x86_64-unknown-linux-gnu` | Native glibc/cargo-binstall asset |
 
-Archives contain the `reporigor` executable, all 24 `crap4*`, `dry4*`, and
-`mutate4*` compatibility command names, the example configuration, the
-machine-readable report schemas, `README.md`, `AGENT_PROMPT.md`, `LICENSE`, and
-`THIRD_PARTY_NOTICES.md`. Unix archives represent the compatibility commands as
-symlinks to the multicall executable; Windows archives contain `.exe` copies.
-GitHub retains these workflow artifacts for 14 days. Archive names are stable
-per Rust target; a future GitHub Release tag supplies the versioned URL.
+The wider cargo-dist plan still describes Windows and later Homebrew, npm,
+shell, and PowerShell channels. They are not part of the first local
+macOS/Linux publication.
 
-The `reporigor` Cargo manifest contains matching `cargo-binstall` metadata, so a
-published release can be installed without compiling. cargo-dist's generated
-installers also handle PATH placement and select an archive for the host OS and
-architecture.
+## Verify a manual download
 
-## Verify a download
-
-Keep the archive and its `.sha256` file in the same directory. On Linux, run:
+Keep an archive and its `.sha256` file together. On Linux:
 
 ```sh
 sha256sum -c reporigor-*.sha256
 ```
 
-On macOS, run:
+On macOS:
 
 ```sh
 shasum -a 256 -c reporigor-*.sha256
 ```
 
-On Windows PowerShell, compare the first value in the checksum file with:
+For macOS, an extracted binary must additionally pass:
 
-```powershell
-(Get-FileHash .\reporigor-*.zip -Algorithm SHA256).Hash.ToLowerInvariant()
+```sh
+codesign --verify --strict --verbose=2 reporigor
+codesign --display --verbose=4 reporigor
 ```
 
-## Promotion is a separate decision
-
-Downloading and verifying these artifacts is the end of the automated flow.
-Publishing to crates.io, creating a GitHub Release, attaching assets to a
-release, signing artifacts, or distributing packages requires an explicit,
-separately reviewed maintainer action. Do not treat a successful artifact build
-as a publication approval.
+The displayed authority must begin with `Developer ID Application:` and
+`TeamIdentifier` must equal `N43S8JF6JT`. An Apple notarization ticket is
+recorded by binary hash; bare command-line executables cannot carry a stapled
+ticket like an application bundle.

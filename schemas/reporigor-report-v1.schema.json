@@ -200,6 +200,33 @@
         "mutation_errors": {
           "$ref": "#/$defs/nonNegativeInteger"
         },
+        "rule_results": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "rule_failures": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "omitted_checks": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "surviving_mutants": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "baseline_existing": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "baseline_new": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "baseline_worsened": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "baseline_improved": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "baseline_resolved": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
         "findings": {
           "$ref": "#/$defs/nonNegativeInteger"
         },
@@ -389,6 +416,9 @@
         },
         "empty_ranges": {
           "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "ambiguous_functions": {
+          "$ref": "#/$defs/nonNegativeInteger"
         }
       },
       "additionalProperties": true
@@ -418,6 +448,10 @@
         },
         "end_line": {
           "$ref": "#/$defs/positiveLine"
+        },
+        "stable_symbol": {
+          "type": "string",
+          "minLength": 1
         }
       },
       "additionalProperties": true
@@ -428,6 +462,22 @@
       "properties": {
         "token_count": {
           "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "clone_group_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "similarity": {
+          "type": "number",
+          "minimum": 0,
+          "maximum": 1
+        },
+        "statement_count": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "algorithm": {
+          "type": "string",
+          "minLength": 1
         },
         "locations": {
           "type": "array",
@@ -478,6 +528,10 @@
         "survived": {
           "$ref": "#/$defs/nonNegativeInteger"
         },
+        "scoreable_mutants": {
+          "description": "Mutation-score denominator; scoreable statuses are exactly killed and survived.",
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
         "no_coverage": {
           "$ref": "#/$defs/nonNegativeInteger"
         },
@@ -520,8 +574,7 @@
         "start_byte",
         "end_byte",
         "status",
-        "exit_code",
-        "duration_seconds"
+        "exit_code"
       ],
       "properties": {
         "id": {
@@ -532,6 +585,15 @@
         },
         "file": {
           "$ref": "#/$defs/path"
+        },
+        "stable_symbol": {
+          "type": "string"
+        },
+        "operator": {
+          "type": "string"
+        },
+        "fingerprint": {
+          "type": "string"
         },
         "line": {
           "description": "One-based start line.",
@@ -570,13 +632,6 @@
         },
         "exit_code": {
           "type": ["integer", "null"]
-        },
-        "duration_seconds": {
-          "type": "number",
-          "minimum": 0
-        },
-        "detail": {
-          "type": "string"
         }
       },
       "additionalProperties": true
@@ -630,29 +685,233 @@
     },
     "commandOutcome": {
       "type": "object",
-      "required": [
-        "exit_code",
-        "timed_out",
-        "duration_seconds",
-        "output",
-        "output_truncated"
-      ],
+      "required": ["exit_code", "timed_out"],
       "properties": {
         "exit_code": {
           "type": ["integer", "null"]
         },
         "timed_out": {
           "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ruleSummary": {
+      "type": "object",
+      "required": [
+        "total",
+        "passed",
+        "failed",
+        "baseline_existing",
+        "baseline_new",
+        "baseline_worsened",
+        "baseline_improved",
+        "baseline_resolved"
+      ],
+      "properties": {
+        "total": {
+          "$ref": "#/$defs/nonNegativeInteger"
         },
-        "duration_seconds": {
+        "passed": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "failed": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "baseline_existing": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "baseline_new": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "baseline_worsened": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "baseline_improved": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "baseline_resolved": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ruleResult": {
+      "type": "object",
+      "required": [
+        "rule_id",
+        "violation_id",
+        "file",
+        "stable_symbol",
+        "measured",
+        "allowed",
+        "algorithm",
+        "structural_evidence",
+        "result",
+        "comparison",
+        "excess",
+        "baseline"
+      ],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "violation_id": {
+          "description": "Lowercase SHA-256 stable violation ID; uniqueness is also enforced by runtime validation.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "file": {
+          "description": "Canonical repository-relative path; relative-path validation is enforced at runtime.",
+          "$ref": "#/$defs/path"
+        },
+        "stable_symbol": {
+          "type": "string",
+          "minLength": 1
+        },
+        "measured": true,
+        "allowed": true,
+        "algorithm": {
+          "type": "string",
+          "minLength": 1
+        },
+        "structural_evidence": {
+          "description": "Canonical non-volatile evidence hashed into violation_id.",
+          "type": "string",
+          "minLength": 1
+        },
+        "result": {
+          "enum": ["pass", "fail"]
+        },
+        "comparison": {
+          "enum": [
+            "maximum",
+            "maximum-exclusive",
+            "minimum",
+            "boolean",
+            "informational"
+          ]
+        },
+        "excess": {
           "type": "number",
           "minimum": 0
         },
-        "output": {
-          "type": "string"
+        "baseline": {
+          "enum": [
+            "not-applicable",
+            "disabled",
+            "existing",
+            "new",
+            "worsened",
+            "improved",
+            "resolved"
+          ]
+        }
+      },
+      "additionalProperties": true
+    },
+    "survivingMutant": {
+      "type": "object",
+      "required": ["file", "stable_symbol", "operator", "fingerprint"],
+      "properties": {
+        "file": {
+          "$ref": "#/$defs/path"
         },
-        "output_truncated": {
+        "stable_symbol": {
+          "type": "string",
+          "minLength": 1
+        },
+        "operator": {
+          "type": "string",
+          "minLength": 1
+        },
+        "fingerprint": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "omittedCheck": {
+      "type": "object",
+      "required": ["rule_id", "reason"],
+      "properties": {
+        "rule_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1
+        }
+      },
+      "additionalProperties": true
+    },
+    "ruleBaselineMetadata": {
+      "type": "object",
+      "required": ["enabled", "resolved", "gate_passed"],
+      "properties": {
+        "enabled": {
           "type": "boolean"
+        },
+        "path": {
+          "description": "Repository-relative path to a prior native RepoRigor JSON report.",
+          "$ref": "#/$defs/path"
+        },
+        "resolved": {
+          "$ref": "#/$defs/nonNegativeInteger"
+        },
+        "gate_passed": {
+          "type": "boolean"
+        }
+      },
+      "additionalProperties": true
+    },
+    "ruleReport": {
+      "type": "object",
+      "required": [
+        "formulas",
+        "summary",
+        "results",
+        "surviving_mutants",
+        "omitted"
+      ],
+      "properties": {
+        "analysis_scope": {
+          "description": "Lowercase SHA-256 fingerprint of deterministic check scope and configuration.",
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "formulas": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string"
+          }
+        },
+        "summary": {
+          "$ref": "#/$defs/ruleSummary"
+        },
+        "results": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/ruleResult"
+          }
+        },
+        "surviving_mutants": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/survivingMutant"
+          }
+        },
+        "omitted": {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/omittedCheck"
+          }
+        },
+        "baseline": {
+          "$ref": "#/$defs/ruleBaselineMetadata"
         }
       },
       "additionalProperties": true
@@ -668,6 +927,9 @@
         },
         "mutate": {
           "$ref": "#/$defs/mutationReport"
+        },
+        "rules": {
+          "$ref": "#/$defs/ruleReport"
         }
       },
       "additionalProperties": true

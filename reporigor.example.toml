@@ -6,10 +6,15 @@ max_source_bytes = 8388608
 [crap]
 fail_over = 6.0
 allow_missing_coverage = false
+unreported_as_zero = false
 allow_empty = false
 
 [dry]
 min_tokens = 30
+min_statements = 5
+# Multiset Sorensen-Dice similarity over normalized-token shingles.
+similarity_threshold = 0.92
+shingle_tokens = 4
 max_groups = 50
 max_occurrences_per_window = 100
 max_total_windows = 1000000
@@ -19,6 +24,54 @@ fail = false
 
 [mutation]
 timeout_seconds = 120.0
+# Score is killed / (killed + survived); every other status is non-scoreable.
+minimum_score = 0.80
+operators = ["boolean-literal", "comparison", "logical", "arithmetic"]
+# The seed deterministically orders stable structural mutant fingerprints.
+seed = 76412026
+# The current crash-safe executor is deliberately serial.
+workers = 1
 # test_command = "cargo test"
 # validation_command = "cargo check"
 # max_mutants = 100
+
+[kiss]
+maximum_cyclomatic_complexity = 12
+maximum_nesting_depth = 5
+maximum_function_statements = 60
+maximum_parameters = 6
+maximum_module_dependencies = 16
+
+[yagni]
+maximum_unused_private_functions = 0
+maximum_unused_modules = 0
+maximum_unused_production_dependencies = 0
+maximum_unreachable_statements = 0
+maximum_unused_feature_flags = 0
+maximum_unreferenced_crate_exports = 0
+# Add checked-in repository entry points here; adapters also exclude generated,
+# target-gated, framework-managed, reflected, and externally invoked code.
+entry_points = ["main", "build.rs"]
+
+[architecture]
+maximum_module_fan_out = 12
+# Every edge is a deterministic source->destination package-pattern predicate.
+forbidden_edges = []
+domain_modules = []
+infrastructure_modules = []
+interface_modules = []
+implementation_modules = []
+contract_traits = []
+contract_test_marker = "reporigor_contract"
+
+# Lower numbered layers may not depend on higher numbered layers.
+[architecture.layers]
+
+[cohesion]
+# Related function pairs / all function pairs; singleton modules equal 1.0.
+minimum = 0.10
+
+[baseline]
+# Reads a prior native RepoRigor report; normal checks never rewrite it.
+enabled = false
+path = "reporigor-baseline.json"

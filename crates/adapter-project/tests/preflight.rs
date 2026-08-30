@@ -1,13 +1,99 @@
 use std::ffi::OsStr;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use adapter_project::{
     providers, CommandRunner, ProjectAdapter, ProviderCommand, ProviderCommandOutput, ProviderOptions,
+    ProviderProvenance, ProviderResolution, ProviderStatus,
 };
 use reporigor_core::{AnalysisRequest, Capability, CoreError, Language};
 use tempfile::TempDir;
+
+mod support;
+use support::{fixture_executable, write_fixtures};
+
+fn temporary_fixture(files: &[(&str, &str)]) -> TempDir {
+    let fixture = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
+    write_fixtures(fixture.path(), files);
+    fixture
+}
+
+fn typescript_fixture(config: &str, sources: &[(&str, &str)]) -> (TempDir, PathBuf) {
+    let fixture = temporary_fixture(&[("tsconfig.json", config)]);
+    write_fixtures(fixture.path(), sources);
+    let compiler = fixture_executable(fixture.path(), "node_modules/.bin/tsc");
+    (fixture, compiler)
+}
+
+fn preflight_with<R: CommandRunner>(
+    fixture: &TempDir,
+    options: ProviderOptions,
+    runner: R,
+) -> ProviderResolution {
+    ProjectAdapter::with_runner(options, runner)
+        .preflight(&AnalysisRequest::new(fixture.path().to_path_buf()))
+        .unwrap_or_else(|error| panic!("preflight: {error}"))
+}
+
+fn status<'a>(resolution: &'a ProviderResolution, id: &str) -> &'a ProviderStatus {
+    resolution
+        .inventory
+        .iter()
+        .find(|status| status.id == id)
+        .unwrap_or_else(|| panic!("{id} status"))
+}
+
+fn unavailable_status_with_reason<'a>(
+    resolution: &'a ProviderResolution,
+    id: &str,
+    reason_fragment: &str,
+) -> &'a ProviderStatus {
+    let provider = status(resolution, id);
+    assert!(!provider.available);
+    assert!(provider
+        .reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains(reason_fragment)));
+    provider
+}
+
+fn provenance<'a>(resolution: &'a ProviderResolution, id: &str) -> &'a ProviderProvenance {
+    resolution
+        .provenance
+        .iter()
+        .find(|item| item.id == id)
+        .unwrap_or_else(|| panic!("{id} provenance"))
+}
+
+fn sources_for(resolution: &ProviderResolution, language: Language) -> Vec<&str> {
+    resolution
+        .context
+        .sources
+        .iter()
+        .filter(|source| source.language == language)
+        .map(|source| source.relative.as_str())
+        .collect()
+}
+
+fn assert_diagnostic_contains(resolution: &ProviderResolution, backend: &str, fragments: &[&str]) {
+    let matched = resolution.context.diagnostics.iter().any(|diagnostic| {
+        diagnostic.backend == backend
+            && fragments
+                .iter()
+                .all(|fragment| diagnostic.message.contains(fragment))
+    });
+    assert!(matched, "missing {backend} diagnostic containing {fragments:?}");
+}
+
+fn diagnostic<'a>(resolution: &'a ProviderResolution, backend: &str) -> &'a reporigor_core::Diagnostic {
+    let index = resolution
+        .context
+        .diagnostics
+        .iter()
+        .position(|diagnostic| diagnostic.backend == backend)
+        .unwrap_or_else(|| panic!("{backend} diagnostic"));
+    &resolution.context.diagnostics[index]
+}
 
 #[derive(Debug, Clone)]
 struct RecordingRunner {
@@ -16,51 +102,68 @@ struct RecordingRunner {
 }
 
 #[derive(Debug)]
-struct FailingTypeScriptRunner;
+struct FailingRunner {
+    version_text: &'static str,
+    failure_text: &'static str,
+    failure_code: i32,
+}
 
-#[derive(Debug)]
-struct FailingSwiftRunner;
+#[derive(Clone, Copy)]
+enum FailureFixture {
+    TypeScript,
+    Swift,
+}
 
 #[derive(Debug)]
 struct TruncatedTypeScriptRunner;
 
-impl CommandRunner for FailingTypeScriptRunner {
-    fn run(&self, command: &ProviderCommand) -> Result<ProviderCommandOutput, CoreError> {
-        let version = command.args.first() == Some(&"--version".into());
-        Ok(ProviderCommandOutput {
-            exit_code: Some(if version { 0 } else { 2 }),
-            stdout: if version {
-                "Version 7.0.2\n".to_string()
-            } else {
-                String::new()
-            },
-            stderr: if version {
-                String::new()
-            } else {
-                "invalid tsconfig fixture".to_string()
-            },
-            output_truncated: false,
-        })
+fn version_or_failure_output(
+    command: &ProviderCommand,
+    version_text: &str,
+    failure_text: &str,
+    failure_code: i32,
+) -> ProviderCommandOutput {
+    let is_version = command.args.first() == Some(&"--version".into());
+    ProviderCommandOutput {
+        exit_code: Some(if is_version { 0 } else { failure_code }),
+        stdout: if is_version {
+            version_text.to_string()
+        } else {
+            String::new()
+        },
+        stderr: if is_version {
+            String::new()
+        } else {
+            failure_text.to_string()
+        },
+        output_truncated: false,
     }
 }
 
-impl CommandRunner for FailingSwiftRunner {
+impl CommandRunner for FailingRunner {
     fn run(&self, command: &ProviderCommand) -> Result<ProviderCommandOutput, CoreError> {
-        let version = command.args.first() == Some(&"--version".into());
-        Ok(ProviderCommandOutput {
-            exit_code: Some(i32::from(!version)),
-            stdout: if version {
-                "Swift version 6.3.3\n".to_string()
-            } else {
-                String::new()
-            },
-            stderr: if version {
-                String::new()
-            } else {
-                "Package.resolved is out of date and automatic resolution is disabled".to_string()
-            },
-            output_truncated: false,
-        })
+        Ok(version_or_failure_output(
+            command,
+            self.version_text,
+            self.failure_text,
+            self.failure_code,
+        ))
+    }
+}
+
+fn failing_runner(fixture: FailureFixture) -> FailingRunner {
+    let (version_text, failure_text, failure_code) = match fixture {
+        FailureFixture::TypeScript => ("Version 7.0.2\n", "invalid tsconfig fixture", 2),
+        FailureFixture::Swift => (
+            "Swift version 6.3.3\n",
+            "Package.resolved is out of date and automatic resolution is disabled",
+            1,
+        ),
+    };
+    FailingRunner {
+        version_text,
+        failure_text,
+        failure_code,
     }
 }
 
@@ -83,69 +186,12 @@ impl CommandRunner for TruncatedTypeScriptRunner {
     }
 }
 
-impl RecordingRunner {
-    fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            calls: Arc::new(Mutex::new(Vec::new())),
-        }
-    }
-
-    fn calls(&self) -> Vec<ProviderCommand> {
-        self.calls
-            .lock()
-            .unwrap_or_else(|error| panic!("calls lock: {error}"))
-            .clone()
-    }
-}
-
 impl CommandRunner for RecordingRunner {
     fn run(&self, command: &ProviderCommand) -> Result<ProviderCommandOutput, CoreError> {
-        self.calls
-            .lock()
-            .unwrap_or_else(|error| panic!("calls lock: {error}"))
-            .push(command.clone());
-        let name = command
-            .program
-            .file_name()
-            .and_then(OsStr::to_str)
-            .unwrap_or_default();
-        let args = command
-            .args
-            .iter()
-            .map(|argument| argument.to_string_lossy())
-            .collect::<Vec<_>>();
-        let stdout = match name {
-            "tsc" if args.iter().any(|argument| argument == "--showConfig") => {
-                r#"{"compilerOptions":{"strict":true},"files":["src/index.ts"],"futureField":true}"#
-                    .to_string()
-            }
-            "tsc" if args.iter().any(|argument| argument == "--listFilesOnly") => format!(
-                "/outside/lib.es2025.d.ts\r\n{}\r\n",
-                self.root.join("src/index.ts").display()
-            ),
-            "tsc" => "Version 7.0.2\n".to_string(),
-            "swift"
-                if args
-                    == [
-                        "package",
-                        "--disable-automatic-resolution",
-                        "--skip-update",
-                        "--disable-netrc",
-                        "describe",
-                        "--type",
-                        "json",
-                    ] =>
-            {
-                r#"{"name":"Demo","tools_version":"6.0","targets":[{"name":"Demo"},{"name":"DemoTests"}],"new_field":42}"#.to_string()
-            }
-            "swift" => "Swift version 6.3.3\n".to_string(),
-            "python" => "Python 3.14.0\n".to_string(),
-            "bash" => "GNU bash, version 5.2.0\n".to_string(),
-            "shellcheck" => "ShellCheck - shell script analysis tool\nversion: 0.10.0\n"
-                .to_string(),
-            _ => String::new(),
-        };
+        record_command(&self.calls, command);
+        let name = command_name(command);
+        let args = command_arguments(command);
+        let stdout = recorded_stdout(&self.root, name, &args);
         Ok(ProviderCommandOutput {
             exit_code: Some(0),
             stdout,
@@ -155,6 +201,102 @@ impl CommandRunner for RecordingRunner {
     }
 }
 
+fn recording_runner(root: PathBuf) -> RecordingRunner {
+    RecordingRunner {
+        root,
+        calls: Arc::new(Mutex::new(Vec::new())),
+    }
+}
+
+fn recorded_calls(runner: &RecordingRunner) -> Vec<ProviderCommand> {
+    runner
+        .calls
+        .lock()
+        .unwrap_or_else(|error| panic!("calls lock: {error}"))
+        .clone()
+}
+
+fn assert_program_not_called(runner: &RecordingRunner, name: &str) {
+    assert!(recorded_calls(runner)
+        .iter()
+        .all(|command| command.program.file_name() != Some(OsStr::new(name))));
+}
+
+fn record_command(calls: &Mutex<Vec<ProviderCommand>>, command: &ProviderCommand) {
+    calls
+        .lock()
+        .unwrap_or_else(|error| panic!("calls lock: {error}"))
+        .push(command.clone());
+}
+
+fn command_name(command: &ProviderCommand) -> &str {
+    command
+        .program
+        .file_name()
+        .and_then(OsStr::to_str)
+        .unwrap_or_default()
+}
+
+fn command_arguments(command: &ProviderCommand) -> Vec<String> {
+    command
+        .args
+        .iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn recorded_stdout(root: &std::path::Path, name: &str, args: &[String]) -> String {
+    if name == "tsc" {
+        return recorded_typescript_stdout(root, args);
+    }
+    if name == "swift" {
+        return recorded_swift_stdout(args);
+    }
+    recorded_simple_stdout(name).unwrap_or_default().to_string()
+}
+
+fn recorded_typescript_stdout(root: &std::path::Path, args: &[String]) -> String {
+    if args.iter().any(|argument| argument == "--showConfig") {
+        return r#"{"compilerOptions":{"strict":true},"files":["src/index.ts"],"futureField":true}"#
+            .to_string();
+    }
+    if args.iter().any(|argument| argument == "--listFilesOnly") {
+        return format!(
+            "/outside/lib.es2025.d.ts\r\n{}\r\n",
+            root.join("src/index.ts").display()
+        );
+    }
+    "Version 7.0.2\n".to_string()
+}
+
+fn recorded_swift_stdout(args: &[String]) -> String {
+    if args == swift_description_arguments() {
+        r#"{"name":"Demo","tools_version":"6.0","targets":[{"name":"Demo"},{"name":"DemoTests"}],"new_field":42}"#.to_string()
+    } else {
+        "Swift version 6.3.3\n".to_string()
+    }
+}
+
+fn swift_description_arguments() -> Vec<String> {
+    "package --disable-automatic-resolution --skip-update --disable-netrc describe --type json"
+        .split_ascii_whitespace()
+        .map(str::to_string)
+        .collect()
+}
+
+fn recorded_simple_stdout(name: &str) -> Option<&'static str> {
+    let index = ["python", "bash", "shellcheck"]
+        .into_iter()
+        .position(|candidate| candidate == name)?;
+    [
+        "Python 3.14.0\n",
+        "GNU bash, version 5.2.0\n",
+        "ShellCheck - shell script analysis tool\nversion: 0.10.0\n",
+    ]
+    .get(index)
+    .copied()
+}
+
 #[test]
 fn explicit_preflight_uses_native_cli_contracts_and_records_provenance() {
     let fixture = fixture();
@@ -162,7 +304,7 @@ fn explicit_preflight_uses_native_cli_contracts_and_records_provenance() {
         .path()
         .canonicalize()
         .unwrap_or_else(|error| panic!("root: {error}"));
-    let runner = RecordingRunner::new(root.clone());
+    let runner = recording_runner(root.clone());
     let options = ProviderOptions {
         typescript_tsc: Some(root.join("node_modules/.bin/tsc")),
         swift: Some(root.join("tools/swift")),
@@ -176,40 +318,28 @@ fn explicit_preflight_uses_native_cli_contracts_and_records_provenance() {
         .preflight(&AnalysisRequest::new(root.clone()))
         .unwrap_or_else(|error| panic!("preflight: {error}"));
 
-    assert_eq!(
-        version(&resolution.inventory, "typescript"),
-        Some("Version 7.0.2")
-    );
-    assert_eq!(
-        version(&resolution.inventory, "swiftpm"),
-        Some("Swift version 6.3.3")
-    );
-    assert_eq!(version(&resolution.inventory, "python"), Some("Python 3.14.0"));
-    assert_eq!(version(&resolution.inventory, "shellcheck"), Some("0.10.0"));
+    for expectation in
+        "typescript=Version 7.0.2|swiftpm=Swift version 6.3.3|python=Python 3.14.0|shellcheck=0.10.0"
+            .split('|')
+    {
+        let (provider, expected) = expectation
+            .split_once('=')
+            .unwrap_or_else(|| panic!("invalid version fixture: {expectation}"));
+        assert_eq!(version(&resolution.inventory, provider), Some(expected));
+    }
     assert_eq!(resolution.context.backends.len(), 5);
     for id in ["python", "shellcheck"] {
-        let status = resolution
-            .inventory
-            .iter()
-            .find(|status| status.id == id)
-            .unwrap_or_else(|| panic!("{id} status"));
-        assert!(!status.capabilities.contains(Capability::ParseValidation));
+        assert!(!status(&resolution, id)
+            .capabilities
+            .contains(Capability::ParseValidation));
     }
 
-    let configured_ts = resolution
-        .context
-        .sources
-        .iter()
-        .filter(|source| source.language == Language::TypeScript)
-        .map(|source| source.relative.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(configured_ts, vec!["src/index.ts"]);
+    assert_eq!(
+        sources_for(&resolution, Language::TypeScript),
+        vec!["src/index.ts"]
+    );
 
-    let typescript = resolution
-        .provenance
-        .iter()
-        .find(|item| item.id == "typescript")
-        .unwrap_or_else(|| panic!("typescript provenance"));
+    let typescript = provenance(&resolution, "typescript");
     assert_eq!(
         typescript.metadata.get("integration_mode").map(String::as_str),
         Some("cli")
@@ -221,199 +351,114 @@ fn explicit_preflight_uses_native_cli_contracts_and_records_provenance() {
             .map(String::as_str),
         Some("1")
     );
-    let swift = resolution
-        .provenance
-        .iter()
-        .find(|item| item.id == "swiftpm")
-        .unwrap_or_else(|| panic!("Swift provenance"));
+    let swift = provenance(&resolution, "swiftpm");
     assert_eq!(swift.metadata.get("target_count").map(String::as_str), Some("2"));
-    let python = resolution
-        .provenance
-        .iter()
-        .find(|item| item.id == "python")
-        .unwrap_or_else(|| panic!("Python provenance"));
+    let python = provenance(&resolution, "python");
     assert!(python.metadata.contains_key("setup_script"));
     assert!(!root.join("setup-was-executed").exists());
-    assert!(resolution
-        .context
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.message.contains("TypeScript 7")));
+    assert_diagnostic_contains(&resolution, "project-typescript-preflight", &["TypeScript 7"]);
 
-    assert_preflight_commands(&root, &runner.calls());
+    assert_preflight_commands(&root, &recorded_calls(&runner));
 }
 
 #[test]
 fn missing_local_typescript_compiler_never_uses_a_global_candidate() {
-    let fixture = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-    fs::write(fixture.path().join("tsconfig.json"), "{}").unwrap_or_else(|error| panic!("tsconfig: {error}"));
-    fs::write(fixture.path().join("index.ts"), "export {};\n")
-        .unwrap_or_else(|error| panic!("source: {error}"));
-    let runner = RecordingRunner::new(fixture.path().to_path_buf());
-    let adapter = ProjectAdapter::with_runner(ProviderOptions::default(), runner.clone());
-    let resolution = adapter
-        .preflight(&AnalysisRequest::new(fixture.path().to_path_buf()))
-        .unwrap_or_else(|error| panic!("preflight: {error}"));
-    let status = resolution
-        .inventory
-        .iter()
-        .find(|status| status.id == "typescript")
-        .unwrap_or_else(|| panic!("typescript status"));
-    assert!(!status.available);
-    assert!(status.executable.is_none());
-    assert!(status
-        .reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("local")));
-    assert!(runner
-        .calls()
-        .iter()
-        .all(|command| command.program.file_name() != Some(OsStr::new("tsc"))));
+    let fixture = temporary_fixture(&[("tsconfig.json", "{}"), ("index.ts", "export {};\n")]);
+    let runner = recording_runner(fixture.path().to_path_buf());
+    let resolution = preflight_with(&fixture, ProviderOptions::default(), runner.clone());
+    let typescript = unavailable_status_with_reason(&resolution, "typescript", "local");
+    assert!(typescript.executable.is_none());
+    assert_program_not_called(&runner, "tsc");
 }
 
 #[test]
 fn failing_typescript_project_resolution_is_not_reported_available() {
-    let fixture = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-    let tsc = fixture.path().join("node_modules/.bin/tsc");
-    fs::create_dir_all(tsc.parent().unwrap_or_else(|| panic!("tsc parent")))
-        .unwrap_or_else(|error| panic!("node modules: {error}"));
-    fs::write(&tsc, "fixture executable").unwrap_or_else(|error| panic!("tsc: {error}"));
-    make_executable(&tsc);
-    fs::write(fixture.path().join("tsconfig.json"), "invalid")
-        .unwrap_or_else(|error| panic!("tsconfig: {error}"));
-    fs::write(fixture.path().join("index.ts"), "export {};\n")
-        .unwrap_or_else(|error| panic!("source: {error}"));
-    let adapter = ProjectAdapter::with_runner(
+    let (fixture, tsc) = typescript_fixture("invalid", &[("index.ts", "export {};\n")]);
+    let resolution = preflight_with(
+        &fixture,
         ProviderOptions {
             typescript_tsc: Some(tsc),
             ..ProviderOptions::default()
         },
-        FailingTypeScriptRunner,
+        failing_runner(FailureFixture::TypeScript),
     );
-    let resolution = adapter
-        .preflight(&AnalysisRequest::new(fixture.path().to_path_buf()))
-        .unwrap_or_else(|error| panic!("preflight: {error}"));
-    let status = resolution
-        .inventory
-        .iter()
-        .find(|status| status.id == "typescript")
-        .unwrap_or_else(|| panic!("typescript status"));
-    assert!(!status.available);
-    assert!(status
-        .reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("could not resolve")));
+    unavailable_status_with_reason(&resolution, "typescript", "could not resolve");
     assert!(!resolution
         .context
         .backends
         .iter()
         .any(|backend| backend.id == "project-typescript"));
-    assert!(resolution
-        .context
-        .diagnostics
-        .iter()
-        .any(|diagnostic| diagnostic.message.contains("invalid tsconfig fixture")));
+    assert_diagnostic_contains(
+        &resolution,
+        "project-typescript-preflight",
+        &["invalid tsconfig fixture"],
+    );
 }
 
 #[test]
 fn truncated_typescript_file_listing_is_rejected_without_pruning_sources() {
-    let fixture = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-    let tsc = fixture.path().join("node_modules/.bin/tsc");
-    fs::create_dir_all(tsc.parent().unwrap_or_else(|| panic!("tsc parent")))
-        .unwrap_or_else(|error| panic!("node modules: {error}"));
-    fs::write(&tsc, "fixture executable").unwrap_or_else(|error| panic!("tsc: {error}"));
-    make_executable(&tsc);
-    fs::write(fixture.path().join("tsconfig.json"), "{}").unwrap_or_else(|error| panic!("tsconfig: {error}"));
-    fs::write(fixture.path().join("index.ts"), "export const first = 1;\n")
-        .unwrap_or_else(|error| panic!("index source: {error}"));
-    fs::write(fixture.path().join("extra.ts"), "export const second = 2;\n")
-        .unwrap_or_else(|error| panic!("extra source: {error}"));
-    let adapter = ProjectAdapter::with_runner(
+    let (fixture, tsc) = typescript_fixture(
+        "{}",
+        &[
+            ("index.ts", "export const first = 1;\n"),
+            ("extra.ts", "export const second = 2;\n"),
+        ],
+    );
+    let resolution = preflight_with(
+        &fixture,
         ProviderOptions {
             typescript_tsc: Some(tsc),
             ..ProviderOptions::default()
         },
         TruncatedTypeScriptRunner,
     );
-
-    let resolution = adapter
-        .preflight(&AnalysisRequest::new(fixture.path().to_path_buf()))
-        .unwrap_or_else(|error| panic!("preflight: {error}"));
-
-    let status = resolution
-        .inventory
-        .iter()
-        .find(|status| status.id == "typescript")
-        .unwrap_or_else(|| panic!("typescript status"));
-    assert!(!status.available);
-    let sources = resolution
-        .context
-        .sources
-        .iter()
-        .filter(|source| source.language == Language::TypeScript)
-        .map(|source| source.relative.as_str())
-        .collect::<Vec<_>>();
-    assert_eq!(sources, vec!["extra.ts", "index.ts"]);
-    assert!(resolution.context.diagnostics.iter().any(|diagnostic| {
-        diagnostic.backend == "project-typescript-preflight"
-            && diagnostic.message.contains("output exceeded")
-            && diagnostic.message.contains("incomplete")
-    }));
+    assert!(!status(&resolution, "typescript").available);
+    assert_eq!(
+        sources_for(&resolution, Language::TypeScript),
+        vec!["extra.ts", "index.ts"]
+    );
+    assert_diagnostic_contains(
+        &resolution,
+        "project-typescript-preflight",
+        &["output exceeded", "incomplete"],
+    );
 }
 
 #[test]
 fn swift_preflight_failure_explains_locked_offline_requirements() {
-    let fixture = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-    let swift = fixture.path().join("tools/swift");
-    fs::create_dir_all(swift.parent().unwrap_or_else(|| panic!("Swift parent")))
-        .unwrap_or_else(|error| panic!("tools: {error}"));
-    fs::write(&swift, "fixture executable").unwrap_or_else(|error| panic!("Swift: {error}"));
-    make_executable(&swift);
-    fs::write(
-        fixture.path().join("Package.swift"),
-        "// swift-tools-version: 6.0\n",
-    )
-    .unwrap_or_else(|error| panic!("manifest: {error}"));
-    let adapter = ProjectAdapter::with_runner(
+    let fixture = temporary_fixture(&[("Package.swift", "// swift-tools-version: 6.0\n")]);
+    let swift = fixture_executable(fixture.path(), "tools/swift");
+    let resolution = preflight_with(
+        &fixture,
         ProviderOptions {
             swift: Some(swift),
             ..ProviderOptions::default()
         },
-        FailingSwiftRunner,
+        failing_runner(FailureFixture::Swift),
     );
-    let resolution = adapter
-        .preflight(&AnalysisRequest::new(fixture.path().to_path_buf()))
-        .unwrap_or_else(|error| panic!("preflight: {error}"));
-    let status = resolution
-        .inventory
-        .iter()
-        .find(|status| status.id == "swiftpm")
-        .unwrap_or_else(|| panic!("Swift status"));
-    assert!(!status.available);
-    assert!(status
-        .reason
-        .as_deref()
-        .is_some_and(|reason| reason.contains("without dependency resolution or network access")));
-    assert!(status
+    let swiftpm = unavailable_status_with_reason(
+        &resolution,
+        "swiftpm",
+        "without dependency resolution or network access",
+    );
+    assert!(swiftpm
         .hint
         .as_deref()
         .is_some_and(|hint| hint.contains("Package.resolved") && hint.contains("cache")));
-    assert!(resolution.context.diagnostics.iter().any(|diagnostic| {
-        diagnostic.backend == "project-swiftpm-preflight"
-            && diagnostic.message.contains("automatic resolution is disabled")
-    }));
+    assert_diagnostic_contains(
+        &resolution,
+        "project-swiftpm-preflight",
+        &["automatic resolution is disabled"],
+    );
 }
 
 #[test]
 fn missing_shellcheck_does_not_disable_builtin_bash_provider() {
-    let fixture = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-    fs::write(fixture.path().join("script.sh"), "#!/bin/sh\necho ok\n")
-        .unwrap_or_else(|error| panic!("source: {error}"));
-    let bash = fixture.path().join("bash");
-    fs::write(&bash, "fixture executable").unwrap_or_else(|error| panic!("bash: {error}"));
-    make_executable(&bash);
-    let runner = RecordingRunner::new(fixture.path().to_path_buf());
-    let adapter = ProjectAdapter::with_runner(
+    let fixture = temporary_fixture(&[("script.sh", "#!/bin/sh\necho ok\n")]);
+    let bash = fixture_executable(fixture.path(), "bash");
+    let runner = recording_runner(fixture.path().to_path_buf());
+    let resolution = preflight_with(
+        &fixture,
         ProviderOptions {
             bash: Some(bash),
             shellcheck: Some(fixture.path().join("missing-shellcheck")),
@@ -421,19 +466,8 @@ fn missing_shellcheck_does_not_disable_builtin_bash_provider() {
         },
         runner.clone(),
     );
-    let resolution = adapter
-        .preflight(&AnalysisRequest::new(fixture.path().to_path_buf()))
-        .unwrap_or_else(|error| panic!("preflight: {error}"));
-    let bash = resolution
-        .inventory
-        .iter()
-        .find(|status| status.id == "bash")
-        .unwrap_or_else(|| panic!("bash status"));
-    let shellcheck = resolution
-        .inventory
-        .iter()
-        .find(|status| status.id == "shellcheck")
-        .unwrap_or_else(|| panic!("shellcheck status"));
+    let bash = status(&resolution, "bash");
+    let shellcheck = status(&resolution, "shellcheck");
     assert!(bash.available);
     assert!(!shellcheck.available);
     assert!(resolution
@@ -441,33 +475,15 @@ fn missing_shellcheck_does_not_disable_builtin_bash_provider() {
         .backends
         .iter()
         .any(|backend| backend.id == "project-bash"));
-    let shellcheck_diagnostic = resolution
-        .context
-        .diagnostics
-        .iter()
-        .find(|diagnostic| diagnostic.backend == "project-shellcheck")
-        .unwrap_or_else(|| panic!("ShellCheck diagnostic"));
+    let shellcheck_diagnostic = diagnostic(&resolution, "project-shellcheck");
     assert!(!shellcheck_diagnostic.fallback_used);
-    assert!(runner
-        .calls()
-        .iter()
-        .all(|command| command.program.file_name() != Some(OsStr::new("missing-shellcheck"))));
+    assert_program_not_called(&runner, "missing-shellcheck");
 }
 
 #[test]
 fn python_inventory_prefers_project_virtual_environment() {
-    let fixture = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-    let interpreter = fixture.path().join(".venv/bin/python");
-    fs::create_dir_all(
-        interpreter
-            .parent()
-            .unwrap_or_else(|| panic!("interpreter parent")),
-    )
-    .unwrap_or_else(|error| panic!("virtual environment: {error}"));
-    fs::write(&interpreter, "fixture executable").unwrap_or_else(|error| panic!("interpreter: {error}"));
-    make_executable(&interpreter);
-    fs::write(fixture.path().join("pyproject.toml"), "[project]\nname='demo'\n")
-        .unwrap_or_else(|error| panic!("pyproject: {error}"));
+    let fixture = temporary_fixture(&[("pyproject.toml", "[project]\nname='demo'\n")]);
+    let interpreter = fixture_executable(fixture.path(), ".venv/bin/python");
     let status = providers(fixture.path())
         .into_iter()
         .find(|status| status.id == "python")
@@ -516,18 +532,10 @@ fn assert_preflight_commands(root: &PathBuf, calls: &[ProviderCommand]) {
         .unwrap_or_else(|| panic!("Swift package describe command"));
     assert_eq!(
         swift_describe.args,
-        [
-            "package",
-            "--disable-automatic-resolution",
-            "--skip-update",
-            "--disable-netrc",
-            "describe",
-            "--type",
-            "json",
-        ]
-        .into_iter()
-        .map(std::ffi::OsString::from)
-        .collect::<Vec<_>>()
+        swift_description_arguments()
+            .into_iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>()
     );
 }
 
@@ -538,28 +546,27 @@ fn version<'a>(inventory: &'a [adapter_project::ProviderStatus], id: &str) -> Op
         .and_then(|status| status.version.as_deref())
 }
 
-fn make_executable(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-
-        let mut permissions = fs::metadata(path)
-            .unwrap_or_else(|error| panic!("metadata for {}: {error}", path.display()))
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(path, permissions)
-            .unwrap_or_else(|error| panic!("permissions for {}: {error}", path.display()));
-    }
-    #[cfg(not(unix))]
-    let _ = path;
-}
-
 fn fixture() -> TempDir {
-    let temp = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-    for directory in ["node_modules/.bin", "tools", "src"] {
-        fs::create_dir_all(temp.path().join(directory))
-            .unwrap_or_else(|error| panic!("create {directory}: {error}"));
-    }
+    let temp = temporary_fixture(&[
+        (
+            "package.json",
+            r#"{"name":"demo","devDependencies":{"typescript":"^7.0.2"}}"#,
+        ),
+        ("tsconfig.json", r#"{"include":["src/index.ts"]}"#),
+        ("src/index.ts", "export const value = 1;\n"),
+        ("src/ignored.ts", "export const ignored = 1;\n"),
+        ("Package.swift", "// swift-tools-version: 6.0\n"),
+        (
+            "pyproject.toml",
+            "[project]\nname = \"demo\"\nrequires-python = \">=3.11\"\n",
+        ),
+        ("app.py", "value = 1\n"),
+        (
+            "setup.py",
+            "from pathlib import Path\nPath('setup-was-executed').write_text('bad')\n",
+        ),
+        ("tool.sh", "#!/usr/bin/env -S bash -eu\necho ok\n"),
+    ]);
     for tool in [
         "node_modules/.bin/tsc",
         "tools/swift",
@@ -567,42 +574,7 @@ fn fixture() -> TempDir {
         "tools/bash",
         "tools/shellcheck",
     ] {
-        let path = temp.path().join(tool);
-        fs::write(&path, "fixture executable").unwrap_or_else(|error| panic!("write {tool}: {error}"));
-        make_executable(&path);
+        fixture_executable(temp.path(), tool);
     }
-    fs::write(
-        temp.path().join("package.json"),
-        r#"{"name":"demo","devDependencies":{"typescript":"^7.0.2"}}"#,
-    )
-    .unwrap_or_else(|error| panic!("package: {error}"));
-    fs::write(
-        temp.path().join("tsconfig.json"),
-        r#"{"include":["src/index.ts"]}"#,
-    )
-    .unwrap_or_else(|error| panic!("tsconfig: {error}"));
-    fs::write(temp.path().join("src/index.ts"), "export const value = 1;\n")
-        .unwrap_or_else(|error| panic!("included source: {error}"));
-    fs::write(temp.path().join("src/ignored.ts"), "export const ignored = 1;\n")
-        .unwrap_or_else(|error| panic!("ignored source: {error}"));
-    fs::write(temp.path().join("Package.swift"), "// swift-tools-version: 6.0\n")
-        .unwrap_or_else(|error| panic!("Swift manifest: {error}"));
-    fs::write(
-        temp.path().join("pyproject.toml"),
-        "[project]\nname = \"demo\"\nrequires-python = \">=3.11\"\n",
-    )
-    .unwrap_or_else(|error| panic!("pyproject: {error}"));
-    fs::write(temp.path().join("app.py"), "value = 1\n")
-        .unwrap_or_else(|error| panic!("Python source: {error}"));
-    fs::write(
-        temp.path().join("setup.py"),
-        "from pathlib import Path\nPath('setup-was-executed').write_text('bad')\n",
-    )
-    .unwrap_or_else(|error| panic!("setup.py: {error}"));
-    fs::write(
-        temp.path().join("tool.sh"),
-        "#!/usr/bin/env -S bash -eu\necho ok\n",
-    )
-    .unwrap_or_else(|error| panic!("Bash source: {error}"));
     temp
 }

@@ -1,9 +1,24 @@
 use std::error::Error;
 use std::path::Path;
-use std::process::Command;
+
+pub mod support;
+use support::fixtures::write_executable_fixture;
+use support::invocation::run;
+use support::success_assertion::assert_success;
 
 #[test]
 fn providers_json_includes_static_mutation_inventory_without_executing_tools() -> Result<(), Box<dyn Error>> {
+    let (root, marker) = stryker_inventory_fixture()?;
+    let output = run(["--format", "json", "providers"]
+        .into_iter()
+        .map(std::ffi::OsString::from)
+        .chain(std::iter::once(root.path().as_os_str().to_owned())))?;
+    assert_success(&output, "providers JSON");
+    assert!(!marker.exists(), "static provider discovery executed Stryker");
+    assert_provider_inventory(&output.stdout)
+}
+
+fn stryker_inventory_fixture() -> Result<(tempfile::TempDir, std::path::PathBuf), Box<dyn Error>> {
     let root = tempfile::tempdir()?;
     std::fs::write(root.path().join("package.json"), "{}\n")?;
     let marker = root.path().join("probe-ran");
@@ -13,31 +28,18 @@ fn providers_json_includes_static_mutation_inventory_without_executing_tools() -
         root.path().join("node_modules/.bin/stryker")
     };
     write_executable(&executable, &marker)?;
+    Ok((root, marker))
+}
 
-    let output = Command::new(env!("CARGO_BIN_EXE_reporigor"))
-        .args(["--format", "json", "providers"])
-        .arg(root.path())
-        .output()?;
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(!marker.exists(), "static provider discovery executed Stryker");
-    let document: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+fn assert_provider_inventory(output: &[u8]) -> Result<(), Box<dyn Error>> {
+    let document: serde_json::Value = serde_json::from_slice(output)?;
     let mutation = document["mutation"]["providers"]
         .as_array()
         .ok_or("mutation provider inventory must be an array")?;
-    let built_in = mutation
-        .iter()
-        .find(|status| status["id"] == "built-in")
-        .ok_or("built-in mutation provider missing")?;
+    let built_in = provider(mutation, "built-in")?;
     assert_eq!(built_in["default"], true);
     assert_eq!(built_in["execution_enabled"], true);
-    let stryker = mutation
-        .iter()
-        .find(|status| status["id"] == "stryker")
-        .ok_or("Stryker mutation provider missing")?;
+    let stryker = provider(mutation, "stryker")?;
     assert_eq!(stryker["applicable"], true);
     assert_eq!(stryker["available"], true);
     assert_eq!(stryker["execution_enabled"], false);
@@ -48,11 +50,11 @@ fn providers_json_includes_static_mutation_inventory_without_executing_tools() -
 #[test]
 fn providers_text_distinguishes_builtin_execution_from_external_import() -> Result<(), Box<dyn Error>> {
     let root = tempfile::tempdir()?;
-    let output = Command::new(env!("CARGO_BIN_EXE_reporigor"))
-        .args(["providers"])
-        .arg(root.path())
-        .output()?;
-    assert!(output.status.success());
+    let output = run([
+        std::ffi::OsString::from("providers"),
+        root.path().as_os_str().to_owned(),
+    ])?;
+    assert_success(&output, "providers text");
     let stdout = String::from_utf8(output.stdout)?;
     assert!(stdout.contains("MUTATION_PROVIDER  DEFAULT"));
     assert!(stdout.contains("built-in  true  true  true  execute"));
@@ -62,21 +64,20 @@ fn providers_text_distinguishes_builtin_execution_from_external_import() -> Resu
 }
 
 fn write_executable(path: &Path, marker: &Path) -> Result<(), Box<dyn Error>> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let contents = if cfg!(windows) {
         format!("@echo off\r\ntype nul > \"{}\"\r\n", marker.display())
     } else {
         format!("#!/bin/sh\n: > \"{}\"\n", marker.display())
     };
-    std::fs::write(path, contents)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mut permissions = std::fs::metadata(path)?.permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(path, permissions)?;
-    }
-    Ok(())
+    write_executable_fixture(path, &contents).map_err(Into::into)
+}
+
+fn provider<'a>(
+    providers: &'a [serde_json::Value],
+    id: &str,
+) -> Result<&'a serde_json::Value, Box<dyn Error>> {
+    providers
+        .iter()
+        .find(|status| status["id"] == id)
+        .ok_or_else(|| format!("mutation provider {id} is missing").into())
 }

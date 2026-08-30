@@ -6,6 +6,7 @@
 mod human;
 mod model;
 mod mutation_elements;
+mod names;
 mod sarif;
 
 pub use analysis_crap::CoverageApplication;
@@ -13,11 +14,13 @@ pub use analysis_dry::{Duplicate, Location as DuplicateLocation};
 pub use human::{escape_terminal_text, render_human};
 pub use model::{
     CrapReport, CrapSummary, DryReport, DrySummary, MutationReport, MutationRunProvenance, MutationSummary,
-    ReportCommand, ReportContext, ReportData, ReportEnvelope, ReportSummary, ToolInfo,
+    QualityReport, ReportCommand, ReportContext, ReportData, ReportEnvelope, ReportSummary,
+    RuleBaselineMetadata, RuleReport, ToolInfo,
 };
 pub use mutation_elements::{mutation_elements_json, mutation_elements_value, MutationThresholds};
 pub use sarif::{sarif_json, sarif_value};
 
+pub(crate) use names::indexed_name;
 use serde::Serialize;
 
 /// Native report schema version. A breaking semantic change requires a new
@@ -42,6 +45,8 @@ pub enum ReportError {
     InvalidMutationSpan { id: u64, file: String, message: String },
     #[error("mutation thresholds must satisfy 0 <= low <= high <= 100 (low={low}, high={high})")]
     InvalidMutationThresholds { low: u8, high: u8 },
+    #[error("invalid deterministic rule report: {0}")]
+    InvalidRules(String),
 }
 
 /// Serialize a report projection as stable, newline-terminated pretty JSON.

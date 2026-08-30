@@ -27,13 +27,20 @@ command line + reporigor.toml
               v
        AnalysisSnapshot
  files, functions, token sets,
- mutations, backends, diagnostics
+ mutations, repository semantics,
+ backends, diagnostics, reliability
               |
-      +-------+--------+
-      |       |        |
+      +-------+---------+
+      |       |         |
      CRAP     DRY    mutation
-      |       |        |
-      +-------+--------+
+      |       |         |
+      +-------+---------+
+              |
+              v
+ integrated deterministic rules
+ CRAP, DRY, mutation, KISS, YAGNI,
+ dependencies/SOLID, coupling, cohesion
+              |
               v
        ReportEnvelope v1
       /       |         \
@@ -43,7 +50,9 @@ command line + reporigor.toml
 
 The CLI constructs one `AnalysisRequest`, analyzes the project once per
 command, then passes the normalized snapshot to language-neutral analyzers.
-`check` reuses that snapshot for all three result sections.
+`check` reuses that snapshot for the legacy CRAP/DRY/mutation sections and one
+canonical `results.rules` stream. There is no second executable, configuration
+loader, report envelope, or mutation executor for the structural rules.
 
 ## Workspace boundaries
 
@@ -55,8 +64,9 @@ command, then passes the normalized snapshot to language-neutral analyzers.
 | `adapter-clang` | Existing compilation-database discovery, safe argv normalization, bounded Clang validation/JSON AST analysis, and native C-family functions/complexity. |
 | `adapter-project` | Filesystem-only provider inventory plus explicit bounded preflight for TypeScript, SwiftPM, Python, Bash, and optional ShellCheck. |
 | `analysis-crap` | Coverage loading/path normalization, executable-line matching, and the CRAP formula. |
-| `analysis-dry` | Language-neutral normalized-token clone detection. |
-| `analysis-mutate` | Locking, recovery journal, source replacement/restoration, subprocess supervision, and mutation status classification. |
+| `analysis-dry` | Language-neutral exact token-region and function-level shingle/Dice clone detection. |
+| `analysis-mutate` | Typed operator selection, deterministic seeded ordering, locking, recovery journal, source replacement/restoration, subprocess supervision, and mutation status classification. |
+| `analysis-quality` | Deterministic integrated rule evaluation, capability-gated omissions, dependency/coupling algorithms, and native-report baseline comparison. |
 | `provider-mutation` | Static optional-engine inventory, bounded version preflight, and normalization of existing ecosystem mutation reports; no external-engine execution. |
 | `reporigor-reporting` | Stable report envelope, deterministic human/native JSON rendering, SARIF 2.1.0, and Mutation Testing Elements v2. |
 | `reporigor` | Argument/config precedence, routing, analyzer orchestration, quality policy, report selection, and exit codes. |
@@ -75,19 +85,32 @@ The central types in `reporigor-core` are:
   generated/test classification.
 - `BackendInfo`: stable ID, version, native/generic marker, and declared
   capabilities.
-- `FunctionRecord`: language, qualified name where available, file/range,
-  complexity, and optional coverage/CRAP values.
+- `FunctionRecord`: language, repository-relative file/range, stable structural
+  symbol, complexity/nesting/statement/parameter counts, normalized tokens,
+  resolved references, visibility, package/entry-point data, a structural
+  reliability mark, and optional coverage/CRAP values.
 - `TokenRecord`: normalized token value, line, and per-file token index.
-- `MutationCandidate`: stable run-local ID, source location, original text,
-  replacement, and private byte edit span.
+- `MutationCandidate`: stable run-local ID, stable symbol/operator/fingerprint,
+  source location, original text, replacement, and private byte edit span.
 - `Diagnostic`: severity, backend, optional location, message, and explicit
   fallback marker.
+- `RepositorySemantics`: canonical package/dependency/module/reachability rows,
+  identifier/feature/trait/test inventories, and an independent reliability
+  flag for every inventory family.
 - `AnalysisSnapshot`: merged files, backends, functions, per-file token sets,
-  candidates, diagnostics, and parse-error count.
+  candidates, repository semantics, diagnostics, and parse-error count.
+- `RuleResult`: rule and stable violation IDs, repository-relative file,
+  stable symbol, measured/allowed JSON values, algorithm, typed comparison,
+  pass/fail result, finite excess, and baseline disposition.
 
-Mutation IDs are assigned only after all adapters finish. Candidates are sorted
-by file and exact edit span, making IDs deterministic for equivalent input and
-toolchain state.
+Mutation identities are assigned only after all adapters finish. A two-pass
+merge fills stable symbols/operators, sorts by structural evidence, preserves
+unique adapter fingerprints, deterministically disambiguates collisions, and
+then assigns run-local IDs in canonical order. Core-generated fingerprint hashes
+exclude line, column, and byte offsets; adapters must provide the same structural
+stability when they supply a fingerprint. Fixed operators plus the configured
+seed determine execution order. Location fields remain available for applying
+an edit but do not define its durable identity.
 
 Capabilities are explicit rather than inferred from a backend name:
 
@@ -313,15 +336,21 @@ does not yet have a report-import CLI option.
 ### CRAP
 
 Adapters provide function ranges and complexity. `analysis-crap` maps a
-normalized executable-line coverage report to each inclusive range and applies:
+normalized executable-line coverage report to each inclusive range, excluding
+the strict interiors of adapter-recorded nested function/closure ranges from
+the outer denominator, and applies:
 
 ```text
 CRAP = complexity² × (1 - coverage/100)³ + complexity
 ```
 
 Coverage paths are normalized across absolute/relative and slash conventions.
-Ambiguous or empty matches remain explicitly missing rather than being treated
-as zero coverage.
+If nested and outer executable code share a boundary line, line-only coverage
+cannot assign that line reliably; the outer function is counted as
+coverage-ambiguous and receives no CRAP score. Ambiguous or empty matches remain
+explicitly missing rather than being treated as zero coverage. The same rule
+applies to sibling function ranges that own one reported executable line, such
+as same-line overload definitions.
 
 Coverage files are bounded and read only after non-symlink regular-file checks.
 Directory discovery is canonical-contained and bounded by entry, directory,
@@ -346,6 +375,21 @@ root-relative locations. Immutable total-window, fingerprint-bucket, and exact
 candidate-work ceilings fail closed with typed errors instead of returning a
 partial result.
 
+For adapter-marked reliable functions, the same analyzer also compares
+normalized-token shingle multisets. With `shared` equal to the multiset
+intersection size, the similarity is:
+
+```text
+Dice(A, B) = 2 × shared / (|A| + |B|)
+```
+
+The default eligible function has at least 30 normalized tokens and 5 recursive
+statements, uses 4-token shingles, and is a clone at similarity `>= 0.92`.
+Accepted pairs are joined into canonical groups; the group reports its minimum
+accepted pair similarity. Exact-region groups remain for unmapped or unreliable
+regions, so gaining function structure enriches DRY without erasing the safe
+fallback.
+
 ### Mutation
 
 Adapters enumerate syntax-aware replacements, but do not execute them. The
@@ -358,6 +402,84 @@ Statuses use one vocabulary:
 killed, survived, no-coverage, compile-error, runtime-error,
 timeout, invalid, ignored, pending
 ```
+
+The fixed configurable operator vocabulary is `boolean-literal`, `comparison`,
+`logical`, and `arithmetic`. A unique structural fingerprint is required before
+selection. The configured seed orders `SHA-256(seed, fingerprint)` keys, and
+the existing serial executor alone applies `max_mutants`; later candidates are
+`ignored`.
+
+Validation and test children receive the active candidate through the
+`REPORIGOR_MUTANT_ID` and `REPORIGOR_MUTANT_FINGERPRINT` environment variables;
+baseline children receive neither. This lets incremental build systems use a
+separate artifact cache for every candidate, avoiding both coarse timestamp
+ambiguity and reuse of an earlier mutant's compiled artifact. The active source
+replacement also receives a fresh timestamp so an incremental tool cannot
+silently reuse the baseline binary; restoration reinstates the exact original
+timestamp and other supported metadata.
+
+Mutation quality uses:
+
+```text
+score = killed / (killed + survived)
+```
+
+Only `killed` and `survived` are scoreable. Every other status in the shared
+vocabulary is excluded from the denominator, and no equivalent-mutant status
+is inferred. The default minimum is `0.80`; equality passes. No scoreable
+results produces an explicit omission. A survivor also produces its own failed
+rule row, keyed by the candidate fingerprint.
+
+### Integrated structural rules
+
+`analysis-quality` consumes the adapter snapshot after CRAP, DRY, and optional
+mutation execution. It emits one sorted rule stream in this order of concern:
+
+- KISS applies inclusive maxima to cyclomatic complexity (`12`), recursive
+  control-flow nesting (`5`), recursive statements (`60`), parameters (`6`),
+  and distinct direct production dependencies (`16`). Nested function bodies
+  are excluded from the recursive structure of their enclosing function.
+- YAGNI applies zero-count defaults to unused unambiguous private functions,
+  unused modules, unused production dependencies, unreachable statements,
+  unused non-default features, and unreferenced repository-restricted exports.
+  Generated, target-gated, framework/reflection managed, externally invoked,
+  explicit entry-point, ambiguous, and unrestricted public cases are excluded
+  rather than guessed dead.
+- Dependency/SOLID rules enforce configured layer direction, forbidden-edge,
+  domain-to-infrastructure, and interface-to-implementation predicates; detect
+  internal production cycles with Tarjan strongly connected components;
+  cap direct production fan-out at `12`; and optionally require an exact
+  trait/implementation contract test bearing the configured marker.
+- Coupling is informational. `Ca` counts repository packages with a direct
+  internal production edge to the package; `Ce` counts distinct direct
+  production dependencies, internal and external. Instability is
+  `Ce / (Ca + Ce)`, or `0` for an isolated package.
+- Module cohesion groups functions by repository-relative file and
+  adapter-qualified module/type owner. It is `related function pairs / all
+  function pairs`, with a singleton equal to `1`. A pair is related when both
+  functions belong to the same exact `(implementation type, trait)` contract,
+  or by a uniquely resolved direct call, a shared uniquely resolved local
+  callee, or a shared non-ubiquitous non-local reference. The default minimum
+  is `0.10`.
+
+Numeric maximums pass at equality; minimums also pass at equality. Boolean
+rules pass only when measured and allowed values match. Informational rows
+always pass and carry zero excess. Deterministic floating measurements retain
+their full finite value for both comparison and serialization, so a real
+threshold crossing is never rounded away. The complete field names, defaults, and validation boundaries are in
+[CONFIGURATION.md](CONFIGURATION.md#kiss).
+
+Reliability is conservative and granular. An unavailable dependency graph
+omits dependency-count, direction, edge, cycle, fan-out, and coupling rules.
+Unreliable identifier, module, reachability, feature, trait, or test inventories
+omit only the rules that require them. Function structure rules are emitted
+only for reliable records; function-level near-clone DRY does the same while
+retaining exact-token fallback. Missing coverage omits CRAP, and no scoreable
+mutation status omits mutation score. Each explicit omission is serialized
+with its rule ID and reason; missing evidence is never a synthetic zero, pass,
+failure, or resolved baseline item. Because an integrated result with missing
+evidence is incomplete, any nonempty omission list independently makes the
+baseline gate false and makes `check` exit 2.
 
 ### Mutation safety
 
@@ -425,13 +547,40 @@ trusted.
 
 The native `ReportEnvelope` has schema version 1 and contains tool identity,
 command, canonical root, a cross-section summary, sorted backend provenance,
-sorted diagnostics, and optional CRAP/DRY/mutation sections.
+sorted diagnostics, and optional CRAP/DRY/mutation sections. Integrated
+`check` reports also carry `results.rules`: formulas, `RuleSummary`, canonical
+`RuleResult` rows, stable surviving-mutant fingerprints, explicit omitted
+checks, and baseline metadata.
+
+Rule comparisons are typed. Inclusive `maximum` and `minimum` comparisons use
+`max(measured - allowed, 0)` and `max(allowed - measured, 0)` respectively as
+finite `excess`. `maximum-exclusive` fails at equality and uses `f64::EPSILON`
+as that equality failure's positive excess; it represents the inclusive DRY
+clone threshold. A failed boolean has excess `1`; informational metrics pass
+with zero. These serialized comparison and excess values let a later native
+report detect genuine worsening without recalculating an older rule.
+
+Baseline mode reads `results.rules` from an ordinary prior native envelope.
+Its deterministic `analysis_scope` fingerprint must exactly match the current
+selection and normalized configuration, preventing a narrower or otherwise
+different run from resolving debt produced by another scope.
+Matching failures are `existing` unless current excess increased, in which case
+they are `worsened`; unmatched current failures are `new`, prior failures that
+now pass are `improved`, and disappeared prior failures are counted as
+`resolved` only when their rule was evaluated in the current run. The baseline
+classification rejects new and worsened violations. The final integrated gate
+also requires an empty omission list, so missing evidence cannot be hidden by a
+baseline. `check` never writes the configured prior report, and there is no
+second baseline schema.
 
 Constructors sort records and use ordered maps, so equivalent snapshots produce
-byte-for-byte deterministic JSON. The text renderer deliberately emits no ANSI
-escapes. The other formats are projections:
+byte-for-byte deterministic JSON. Native JSON omits mutation wall-clock
+durations, raw child-command output, truncation state, and output-derived
+detail; those values remain internal to execution and human diagnostics. The
+text renderer deliberately emits no ANSI escapes. The other formats are
+projections:
 
-- SARIF 2.1.0 contains CRAP-threshold and duplicate-code rules/findings.
+- SARIF 2.1.0 contains CRAP/DRY findings and failed integrated rule rows.
 - Mutation Testing Elements v2 contains mutation results and required source
   text, using fixed score thresholds 60/80 in the CLI projection.
 
@@ -442,13 +591,36 @@ Exit policy is owned by the CLI rather than individual adapters:
 - 2: quality finding under an active gate.
 
 For mutation, infrastructure/invalid/timeout/disallowed compile-error takes
-precedence over survivor quality failure.
+precedence over survivor quality failure. With integrated baseline mode
+disabled, any failed rule makes `check` a quality failure. With it enabled,
+new or worsened failures make `check` a quality failure; existing debt,
+improvements, resolutions, and informational rows do not. In both modes, any
+nonempty `results.rules.omitted` list forces the baseline gate false and makes
+`check` exit 2.
 
 ## Determinism and side-effect policy
 
 Normal static analysis has no runtime parser downloads. Files, backends,
-diagnostics, functions, duplicate groups, and mutations are sorted before
-reporting. Toolchain versions and fallbacks are included when known.
+diagnostics, functions, repository-semantic inventories, duplicate groups,
+mutations, formulas, omissions, and rule results are sorted before reporting.
+Toolchain versions and fallbacks are included when known.
+
+Every durable rule violation ID is the 64-character lowercase SHA-256 of
+length-delimited `(rule_id, repository-relative path, stable_symbol,
+normalized structural evidence)`. Repository separators and redundant `.`
+components are normalized. Absolute checkout roots, line/column/byte offsets,
+timestamps, command durations, thread scheduling, and enumeration order are
+not hash inputs. Clone-group and mutation fingerprints use the same structural
+principle, so unrelated line movement and input permutation do not rename an
+unchanged finding. Paths, symbols, or normalized structure changing may
+intentionally produce a new identity.
+
+Canonical report construction rejects absolute/traversing rule paths,
+non-lowercase or non-SHA-256 IDs, duplicate IDs, and non-canonical ordering.
+Rule constructors require finite numeric measurements and excess; baseline
+loading rejects a prior non-finite excess. Stable seeded mutation selection and
+the enforced single worker make `max_mutants` reproducible for a fixed snapshot
+and seed.
 
 Side effects are explicit by layer:
 

@@ -1,8 +1,11 @@
 struct SecondChoice {
-  func choose(_ left: Int, _ right: Int) -> Int {
-    if left > 0 && right != 0 {
-      return left + right
+  func choose(_ first: Int, _ second: Int) -> Int {
+    var result = first + second
+    let threshold = 25
+    result = result * 3
+    if first > 1 && second != 2 {
+      result = result + threshold
     }
-    return 0
+    return result
   }
 }

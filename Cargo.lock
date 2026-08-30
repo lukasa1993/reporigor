@@ -18,8 +18,8 @@ dependencies = [
 name = "adapter-project"
 version = "0.1.0"
 dependencies = [
+ "provider-mutation",
  "reporigor-core",
- "reporigor-process-tree",
  "serde",
  "serde_json",
  "tempfile",
@@ -96,6 +96,7 @@ name = "analysis-mutate"
 version = "0.1.0"
 dependencies = [
  "base64",
+ "ctrlc",
  "fs2",
  "reporigor-core",
  "reporigor-process-tree",
@@ -106,6 +107,18 @@ dependencies = [
  "tempfile",
  "thiserror",
  "winapi-util",
+]
+
+[[package]]
+name = "analysis-quality"
+version = "0.1.0"
+dependencies = [
+ "analysis-dry",
+ "analysis-mutate",
+ "reporigor-core",
+ "serde",
+ "serde_json",
+ "tempfile",
 ]
 
 [[package]]
@@ -273,6 +286,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "toml",
 ]
 
@@ -585,12 +599,10 @@ dependencies = [
  "adapter-rust",
  "adapter-tree-sitter",
  "analysis-crap",
- "analysis-dry",
  "analysis-mutate",
+ "analysis-quality",
  "anyhow",
  "clap",
- "ctrlc",
- "provider-mutation",
  "reporigor-core",
  "reporigor-reporting",
  "serde",
@@ -602,14 +614,13 @@ dependencies = [
 name = "reporigor-core"
 version = "0.1.0"
 dependencies = [
- "globset",
  "ignore",
- "indexmap",
  "libc",
  "rustix",
  "same-file",
  "serde",
  "serde_json",
+ "sha2",
  "tempfile",
  "thiserror",
  "toml",
@@ -631,6 +642,7 @@ dependencies = [
  "analysis-crap",
  "analysis-dry",
  "analysis-mutate",
+ "analysis-quality",
  "reporigor-core",
  "serde",
  "serde_json",

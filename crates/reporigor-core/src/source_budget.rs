@@ -101,6 +101,22 @@ impl SourceBudget {
 mod tests {
     use super::*;
 
+    fn filled_budget(max_source_bytes: usize, path: &str, actual_bytes: u64, count: u64) -> SourceBudget {
+        let mut budget =
+            SourceBudget::new(max_source_bytes).unwrap_or_else(|error| panic!("budget: {error}"));
+        for index in 0..count {
+            budget
+                .observe(Path::new(path), actual_bytes)
+                .unwrap_or_else(|error| panic!("source {index}: {error}"));
+        }
+        budget
+    }
+
+    fn assert_budget_exceeded(mut budget: SourceBudget, actual_bytes: u64) {
+        let result = budget.observe(Path::new("overflow"), actual_bytes);
+        assert!(matches!(result, Err(CoreError::SourceBudgetExceeded { .. })));
+    }
+
     #[test]
     fn configurable_limit_cannot_exceed_immutable_ceiling() {
         assert!(SourceBudget::new(MAX_SOURCE_BYTES_HARD_LIMIT).is_ok());
@@ -112,32 +128,15 @@ mod tests {
 
     #[test]
     fn aggregate_byte_limit_is_inclusive_and_typed() {
-        let mut budget =
-            SourceBudget::new(MAX_SOURCE_BYTES_HARD_LIMIT).unwrap_or_else(|error| panic!("budget: {error}"));
         let per_file = u64::try_from(MAX_SOURCE_BYTES_HARD_LIMIT).unwrap_or(u64::MAX);
-        for index in 0..16 {
-            budget
-                .observe(Path::new("source"), per_file)
-                .unwrap_or_else(|error| panic!("source {index}: {error}"));
-        }
+        let budget = filled_budget(MAX_SOURCE_BYTES_HARD_LIMIT, "source", per_file, 16);
         assert_eq!(budget.selected_bytes(), MAX_SELECTED_SOURCE_BYTES);
-        let Err(error) = budget.observe(Path::new("overflow"), 1) else {
-            panic!("aggregate byte overflow was unexpectedly accepted");
-        };
-        assert!(matches!(error, CoreError::SourceBudgetExceeded { .. }));
+        assert_budget_exceeded(budget, 1);
     }
 
     #[test]
     fn selected_file_count_is_bounded() {
-        let mut budget = SourceBudget::new(1).unwrap_or_else(|error| panic!("budget: {error}"));
-        for index in 0..MAX_SELECTED_SOURCE_FILES {
-            budget
-                .observe(Path::new("empty"), 0)
-                .unwrap_or_else(|error| panic!("source {index}: {error}"));
-        }
-        let Err(error) = budget.observe(Path::new("overflow"), 0) else {
-            panic!("source-count overflow was unexpectedly accepted");
-        };
-        assert!(matches!(error, CoreError::SourceBudgetExceeded { .. }));
+        let budget = filled_budget(1, "empty", 0, MAX_SELECTED_SOURCE_FILES);
+        assert_budget_exceeded(budget, 0);
     }
 }

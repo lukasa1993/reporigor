@@ -24,138 +24,212 @@ fn serialize_execution() -> MutexGuard<'static, ()> {
     }
 }
 
-fn project() -> Result<TempDir, std::io::Error> {
+struct ExecutionFixture {
+    _serial: MutexGuard<'static, ()>,
+    directory: TempDir,
+}
+
+impl ExecutionFixture {
+    fn root(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+fn execution_fixture() -> Result<ExecutionFixture, std::io::Error> {
     let directory = tempfile::tempdir()?;
     fs::write(directory.path().join("sample.txt"), b"true\n")?;
-    Ok(directory)
+    Ok(ExecutionFixture {
+        _serial: serialize_execution(),
+        directory,
+    })
 }
 
 fn candidate(id: u64) -> MutationCandidate {
     MutationCandidate {
-        id,
-        language: Language::Python,
-        file: "sample.txt".into(),
-        line: 1,
-        column: 1,
-        original: "true".into(),
-        replacement: "false".into(),
-        start_byte: 0,
         end_byte: 4,
+        start_byte: 0,
+        replacement: "false".into(),
+        original: "true".into(),
+        column: 1,
+        line: 1,
+        fingerprint: String::new(),
+        operator: "boolean-literal".into(),
+        stable_symbol: String::new(),
+        file: "sample.txt".into(),
+        language: Language::Python,
+        id,
     }
 }
 
-fn assert_clean(root: &Path) -> Result<(), std::io::Error> {
+fn assert_clean(fixture: &ExecutionFixture) -> Result<(), std::io::Error> {
+    let root = fixture.root();
     assert_eq!(fs::read(root.join("sample.txt"))?, b"true\n");
     let state = mutation_state_directory(root).map_err(std::io::Error::other)?;
     assert!(!state.join(ACTIVE_JOURNAL).exists());
     Ok(())
 }
 
-#[cfg(windows)]
-fn success_command() -> CommandSpec {
-    CommandSpec::shell("exit /B 0")
+fn fixture_executor(
+    fixture: &ExecutionFixture,
+    options: MutationOptions,
+) -> Result<MutationExecutor, MutationError> {
+    MutationExecutor::new(fixture.root(), options)
+}
+
+fn run_fixture(
+    fixture: &ExecutionFixture,
+    options: MutationOptions,
+    candidates: &[MutationCandidate],
+) -> Result<analysis_mutate::MutationRun, MutationError> {
+    fixture_executor(fixture, options)?.run(candidates)
+}
+
+fn run_single(
+    options: MutationOptions,
+    selected: MutationCandidate,
+) -> Result<analysis_mutate::MutationRun, Box<dyn std::error::Error>> {
+    let fixture = execution_fixture()?;
+    let report = run_fixture(&fixture, options, &[selected])?;
+    assert_clean(&fixture)?;
+    Ok(report)
+}
+
+#[derive(Clone, Copy)]
+enum ExpectedOutcome {
+    Killed,
+    Survived,
+    CompileError,
+    Timeout,
+    RuntimeError,
+    Invalid,
+}
+
+const EXPECTED_OUTCOMES: [(MutationStatus, Option<i32>); 6] = [
+    (MutationStatus::Killed, Some(1)),
+    (MutationStatus::Survived, Some(0)),
+    (MutationStatus::CompileError, Some(1)),
+    (MutationStatus::Timeout, None),
+    (MutationStatus::RuntimeError, None),
+    (MutationStatus::Invalid, None),
+];
+
+fn assert_single_outcome(
+    options: MutationOptions,
+    selected: MutationCandidate,
+    expected: ExpectedOutcome,
+) -> Result<analysis_mutate::MutationRun, Box<dyn std::error::Error>> {
+    let report = run_single(options, selected)?;
+    let (status, exit_code) = EXPECTED_OUTCOMES[expected as usize];
+    assert_eq!(report.results[0].status, status);
+    assert_eq!(report.results[0].exit_code, exit_code);
+    Ok(report)
+}
+
+fn run_error(
+    options: MutationOptions,
+    candidates: &[MutationCandidate],
+) -> Result<MutationError, Box<dyn std::error::Error>> {
+    let fixture = execution_fixture()?;
+    let Err(error) = run_fixture(&fixture, options, candidates) else {
+        panic!("mutation run unexpectedly succeeded");
+    };
+    assert_clean(&fixture)?;
+    Ok(error)
 }
 
 #[cfg(not(windows))]
-fn success_command() -> CommandSpec {
-    CommandSpec::shell("exit 0")
+fn assert_successful_baselines(outcomes: &[Option<&CommandOutcome>]) {
+    assert!(outcomes
+        .iter()
+        .all(|outcome| outcome.is_some_and(CommandOutcome::success)));
 }
 
-#[cfg(windows)]
-fn failure_command() -> CommandSpec {
-    CommandSpec::shell("exit /B 1")
+fn exit_command(code: u8) -> CommandSpec {
+    #[cfg(windows)]
+    let shell = format!("exit /B {code}");
+    #[cfg(not(windows))]
+    let shell = format!("exit {code}");
+    CommandSpec::shell(shell)
 }
 
-#[cfg(not(windows))]
-fn failure_command() -> CommandSpec {
-    CommandSpec::shell("exit 1")
+fn without_baseline(command: impl Into<CommandSpec>) -> MutationOptions {
+    let mut options = MutationOptions::execute(command);
+    options.run_baseline = false;
+    options
 }
 
 #[test]
-fn list_mode_returns_pending_without_running_or_mutating() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = project()?;
-    let state = mutation_state_directory(directory.path())?;
+fn list_mode_returns_pending_without_running_or_mutating() {
+    let fixture =
+        execution_fixture().unwrap_or_else(|error| panic!("failed to create list-mode fixture: {error:?}"));
+    let state = mutation_state_directory(fixture.root())
+        .unwrap_or_else(|error| panic!("failed to resolve mutation state: {error:?}"));
     assert!(!state.exists());
-    let executor = MutationExecutor::new(directory.path(), MutationOptions::list())?;
-    let report = executor.run(&[candidate(1)])?;
+    let report = run_fixture(&fixture, MutationOptions::list(), &[candidate(1)])
+        .unwrap_or_else(|error| panic!("list-mode inventory failed: {error:?}"));
 
     assert_eq!(report.mode, MutationMode::List);
     assert_eq!(report.results.len(), 1);
     assert_eq!(report.results[0].status, MutationStatus::Pending);
     assert!(report.baseline.test.is_none());
-    assert_clean(directory.path())?;
+    assert_clean(&fixture).unwrap_or_else(|error| panic!("list mode left source dirty: {error:?}"));
     assert!(
         !state.exists(),
         "read-only inventory must not create mutation state"
     );
-    Ok(())
 }
 
 #[cfg(not(windows))]
 #[test]
-fn baseline_and_failed_mutant_test_classify_as_killed() -> Result<(), Box<dyn std::error::Error>> {
-    let _serial = serialize_execution();
-    let directory = project()?;
+fn baseline_validation_and_timeout_classify_native_outcomes() -> Result<(), Box<dyn std::error::Error>> {
     let options = MutationOptions::execute("grep -q '^true$' sample.txt");
-    let executor = MutationExecutor::new(directory.path(), options)?;
-    let report = executor.run(&[candidate(1)])?;
+    let report = assert_single_outcome(options, candidate(1), ExpectedOutcome::Killed)?;
+    assert_successful_baselines(&[report.baseline.test.as_ref()]);
 
-    assert!(report.baseline.test.as_ref().is_some_and(CommandOutcome::success));
-    assert_eq!(report.results[0].status, MutationStatus::Killed);
-    assert_eq!(report.results[0].exit_code, Some(1));
-    assert_clean(directory.path())?;
+    let mut invalidated = MutationOptions::execute(exit_command(0));
+    invalidated.validation_command = Some(CommandSpec::shell("grep -q '^true$' sample.txt"));
+    let report = assert_single_outcome(invalidated, candidate(1), ExpectedOutcome::CompileError)?;
+    assert_successful_baselines(&[report.baseline.validation.as_ref()]);
+
+    let mut timed = without_baseline("sleep 1");
+    timed.timeout = Duration::from_millis(20);
+    assert_single_outcome(timed, candidate(1), ExpectedOutcome::Timeout)?;
     Ok(())
 }
 
 #[test]
-fn successful_mutant_test_classifies_as_survived() -> Result<(), Box<dyn std::error::Error>> {
-    let _serial = serialize_execution();
-    let directory = project()?;
-    let mut options = MutationOptions::execute(success_command());
-    options.run_baseline = false;
-    let executor = MutationExecutor::new(directory.path(), options)?;
-    let report = executor.run(&[candidate(1)])?;
+fn nonbaseline_execution_classifies_survived_runtime_and_invalid() -> Result<(), Box<dyn std::error::Error>> {
+    assert_single_outcome(
+        without_baseline(exit_command(0)),
+        candidate(1),
+        ExpectedOutcome::Survived,
+    )?;
 
-    assert_eq!(report.results[0].status, MutationStatus::Survived);
-    assert_clean(directory.path())?;
-    Ok(())
-}
+    let missing = Path::new("__reporigor_missing__").join("missing-test-program");
+    let options = without_baseline(CommandSpec::program(missing, Vec::<String>::new()));
+    assert_single_outcome(options, candidate(1), ExpectedOutcome::RuntimeError)?;
 
-#[cfg(not(windows))]
-#[test]
-fn failed_validation_classifies_as_compile_error() -> Result<(), Box<dyn std::error::Error>> {
-    let _serial = serialize_execution();
-    let directory = project()?;
-    let mut options = MutationOptions::execute(success_command());
-    options.validation_command = Some(CommandSpec::shell("grep -q '^true$' sample.txt"));
-    let executor = MutationExecutor::new(directory.path(), options)?;
-    let report = executor.run(&[candidate(1)])?;
-
-    assert!(report
-        .baseline
-        .validation
-        .as_ref()
-        .is_some_and(CommandOutcome::success));
-    assert_eq!(report.results[0].status, MutationStatus::CompileError);
-    assert_eq!(report.results[0].exit_code, Some(1));
-    assert_clean(directory.path())?;
+    let mut stale = candidate(1);
+    stale.start_byte = 1;
+    stale.end_byte = 5;
+    assert_single_outcome(without_baseline(exit_command(0)), stale, ExpectedOutcome::Invalid)?;
     Ok(())
 }
 
 #[cfg(not(windows))]
 #[test]
-fn timed_out_test_is_not_misclassified_as_killed() -> Result<(), Box<dyn std::error::Error>> {
-    let _serial = serialize_execution();
-    let directory = project()?;
-    let mut options = MutationOptions::execute("sleep 1");
-    options.run_baseline = false;
-    options.timeout = Duration::from_millis(20);
-    let executor = MutationExecutor::new(directory.path(), options)?;
-    let report = executor.run(&[candidate(1)])?;
+fn mutant_commands_receive_identity_but_baseline_does_not() -> Result<(), Box<dyn std::error::Error>> {
+    let command = "if [ \"${REPORIGOR_MUTANT_ID-unset}\" = unset ]; then \
+         test \"${REPORIGOR_MUTANT_FINGERPRINT-unset}\" = unset; \
+         else test \"$REPORIGOR_MUTANT_ID\" = 17 && \
+         test \"$REPORIGOR_MUTANT_FINGERPRINT\" = fixture-fingerprint; fi";
+    let mut options = MutationOptions::execute(command);
+    options.validation_command = Some(CommandSpec::shell(command));
+    let mut selected = candidate(17);
+    selected.fingerprint = "fixture-fingerprint".into();
+    let report = assert_single_outcome(options, selected, ExpectedOutcome::Survived)?;
 
-    assert_eq!(report.results[0].status, MutationStatus::Timeout);
-    assert_eq!(report.results[0].exit_code, None);
-    assert_clean(directory.path())?;
+    assert_successful_baselines(&[report.baseline.validation.as_ref(), report.baseline.test.as_ref()]);
     Ok(())
 }
 
@@ -165,8 +239,7 @@ fn cancellation_restores_source_and_leaves_recovery_clean() -> Result<(), Box<dy
     use std::thread;
     use std::time::Instant;
 
-    let _serial = serialize_execution();
-    let directory = project()?;
+    let fixture = execution_fixture()?;
     let cancellation = CancellationToken::new();
     let mut options = MutationOptions::execute(
         "if grep -q '^false$' sample.txt; then printf started > started.txt; \
@@ -175,7 +248,7 @@ fn cancellation_restores_source_and_leaves_recovery_clean() -> Result<(), Box<dy
     options.run_baseline = false;
     options.cancellation = cancellation.clone();
 
-    let marker = directory.path().join("started.txt");
+    let marker = fixture.root().join("started.txt");
     let canceller = cancellation.clone();
     let cancellation_thread = thread::spawn(move || {
         for _ in 0..200 {
@@ -189,7 +262,7 @@ fn cancellation_restores_source_and_leaves_recovery_clean() -> Result<(), Box<dy
         false
     });
     let started = Instant::now();
-    let executor = MutationExecutor::new(directory.path(), options)?;
+    let executor = fixture_executor(&fixture, options)?;
     let result = executor.run(&[candidate(1)]);
     let observed_mutation = cancellation_thread
         .join()
@@ -201,89 +274,49 @@ fn cancellation_restores_source_and_leaves_recovery_clean() -> Result<(), Box<dy
     );
     assert!(matches!(result, Err(MutationError::Cancelled)));
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert_clean(directory.path())?;
-    let state = mutation_state_directory(directory.path())?;
+    assert_clean(&fixture)?;
+    let state = mutation_state_directory(fixture.root())?;
     assert!(!state.join(ACTIVE_JOURNAL).exists());
-    assert_eq!(recover_active(directory.path())?, RecoveryAction::None);
+    assert_eq!(recover_active(fixture.root())?, RecoveryAction::None);
     thread::sleep(Duration::from_millis(500));
-    assert!(!directory.path().join("leaked.txt").exists());
+    assert!(!fixture.root().join("leaked.txt").exists());
     Ok(())
 }
 
 #[test]
-fn pre_cancelled_run_stops_before_baseline_and_source_changes() -> Result<(), Box<dyn std::error::Error>> {
-    let _serial = serialize_execution();
-    let directory = project()?;
+fn preflight_rejects_cancellation_baseline_failure_and_duplicate_ids(
+) -> Result<(), Box<dyn std::error::Error>> {
     let cancellation = CancellationToken::new();
     cancellation.cancel();
-    let mut options = MutationOptions::execute(success_command());
+    let mut options = MutationOptions::execute(exit_command(0));
     options.cancellation = cancellation;
-    let executor = MutationExecutor::new(directory.path(), options)?;
-
     assert!(matches!(
-        executor.run(&[candidate(1)]),
-        Err(MutationError::Cancelled)
+        run_error(options, &[candidate(1)])?,
+        MutationError::Cancelled
     ));
-    assert_clean(directory.path())?;
-    Ok(())
-}
-
-#[test]
-fn command_spawn_failure_classifies_as_runtime_error() -> Result<(), Box<dyn std::error::Error>> {
-    let _serial = serialize_execution();
-    let directory = project()?;
-    let missing = directory.path().join("missing-test-program");
-    let mut options = MutationOptions::execute(CommandSpec::program(missing, Vec::<String>::new()));
-    options.run_baseline = false;
-    let executor = MutationExecutor::new(directory.path(), options)?;
-    let report = executor.run(&[candidate(1)])?;
-
-    assert_eq!(report.results[0].status, MutationStatus::RuntimeError);
-    assert_clean(directory.path())?;
-    Ok(())
-}
-
-#[test]
-fn stale_candidate_classifies_as_invalid() -> Result<(), Box<dyn std::error::Error>> {
-    let _serial = serialize_execution();
-    let directory = project()?;
-    let mut stale = candidate(1);
-    stale.start_byte = 1;
-    stale.end_byte = 5;
-    let mut options = MutationOptions::execute(success_command());
-    options.run_baseline = false;
-    let executor = MutationExecutor::new(directory.path(), options)?;
-    let report = executor.run(&[stale])?;
-
-    assert_eq!(report.results[0].status, MutationStatus::Invalid);
-    assert_clean(directory.path())?;
-    Ok(())
-}
-
-#[test]
-fn baseline_failure_aborts_before_source_changes() -> Result<(), Box<dyn std::error::Error>> {
-    let _serial = serialize_execution();
-    let directory = project()?;
-    let executor = MutationExecutor::new(directory.path(), MutationOptions::execute(failure_command()))?;
     assert!(matches!(
-        executor.run(&[candidate(1)]),
-        Err(MutationError::BaselineFailed { .. })
+        run_error(MutationOptions::execute(exit_command(1)), &[candidate(1)])?,
+        MutationError::BaselineFailed { .. }
     ));
-    assert_clean(directory.path())?;
+    assert!(matches!(
+        run_error(MutationOptions::list(), &[candidate(1), candidate(1)])?,
+        MutationError::InvalidOptions(_)
+    ));
     Ok(())
 }
 
 #[test]
 fn policy_and_limit_emit_standard_nonexecuted_statuses() -> Result<(), Box<dyn std::error::Error>> {
-    let _serial = serialize_execution();
-    let directory = project()?;
-    let mut options = MutationOptions::execute(success_command());
-    options.run_baseline = false;
+    let fixture = execution_fixture()?;
+    let mut options = without_baseline(exit_command(0));
     options.max_mutants = Some(1);
     options.no_coverage_ids.insert(2);
     options.ignored_ids.insert(3);
-    let executor = MutationExecutor::new(directory.path(), options)?;
-    let report = executor.run(&[candidate(1), candidate(2), candidate(3), candidate(4)])?;
+    let report = run_fixture(
+        &fixture,
+        options,
+        &[candidate(1), candidate(2), candidate(3), candidate(4)],
+    )?;
 
     assert_eq!(report.results[0].status, MutationStatus::Survived);
     assert_eq!(report.results[1].status, MutationStatus::NoCoverage);
@@ -294,18 +327,6 @@ fn policy_and_limit_emit_standard_nonexecuted_statuses() -> Result<(), Box<dyn s
     assert_eq!(summary.survived, 1);
     assert_eq!(summary.no_coverage, 1);
     assert_eq!(summary.ignored, 2);
-    assert_clean(directory.path())?;
-    Ok(())
-}
-
-#[test]
-fn duplicate_candidate_ids_are_rejected_before_baseline() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = project()?;
-    let executor = MutationExecutor::new(directory.path(), MutationOptions::list())?;
-    assert!(matches!(
-        executor.run(&[candidate(1), candidate(1)]),
-        Err(MutationError::InvalidOptions(_))
-    ));
-    assert_clean(directory.path())?;
+    assert_clean(&fixture)?;
     Ok(())
 }

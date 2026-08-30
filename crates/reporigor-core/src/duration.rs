@@ -30,9 +30,13 @@ pub fn checked_duration_from_secs_f64(seconds: f64) -> Result<Duration, InvalidD
 mod tests {
     use super::*;
 
+    fn duration_result(seconds: f64) -> Result<Duration, InvalidDurationSeconds> {
+        checked_duration_from_secs_f64(seconds)
+    }
+
     #[test]
     fn accepts_positive_representable_seconds() {
-        let Ok(duration) = checked_duration_from_secs_f64(0.5) else {
+        let Ok(duration) = duration_result(0.5) else {
             panic!("a half-second timeout must be representable");
         };
         assert_eq!(duration, Duration::from_millis(500));
@@ -50,10 +54,8 @@ mod tests {
             f64::INFINITY,
             f64::NAN,
         ] {
-            assert!(
-                checked_duration_from_secs_f64(seconds).is_err(),
-                "{seconds:?} must not become a timeout"
-            );
+            let result = duration_result(seconds);
+            assert!(result.is_err(), "{seconds:?} must not become a timeout");
         }
     }
 }

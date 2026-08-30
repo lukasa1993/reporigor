@@ -55,10 +55,14 @@ max_source_bytes = 8388608
 [crap]
 fail_over = 6.0
 allow_missing_coverage = false
+unreported_as_zero = false
 allow_empty = false
 
 [dry]
 min_tokens = 30
+min_statements = 5
+similarity_threshold = 0.92
+shingle_tokens = 4
 max_groups = 50
 max_occurrences_per_window = 100
 max_total_windows = 1000000
@@ -68,9 +72,48 @@ fail = false
 
 [mutation]
 timeout_seconds = 120.0
+minimum_score = 0.80
+operators = ["boolean-literal", "comparison", "logical", "arithmetic"]
+seed = 76412026
+workers = 1
 # test_command = "cargo test --workspace"
 # validation_command = "cargo check --workspace"
 # max_mutants = 100
+
+[kiss]
+maximum_cyclomatic_complexity = 12
+maximum_nesting_depth = 5
+maximum_function_statements = 60
+maximum_parameters = 6
+maximum_module_dependencies = 16
+
+[yagni]
+maximum_unused_private_functions = 0
+maximum_unused_modules = 0
+maximum_unused_production_dependencies = 0
+maximum_unreachable_statements = 0
+maximum_unused_feature_flags = 0
+maximum_unreferenced_crate_exports = 0
+entry_points = ["main", "build.rs"]
+
+[architecture]
+maximum_module_fan_out = 12
+forbidden_edges = []
+domain_modules = []
+infrastructure_modules = []
+interface_modules = []
+implementation_modules = []
+contract_traits = []
+contract_test_marker = "reporigor_contract"
+
+[architecture.layers]
+
+[cohesion]
+minimum = 0.10
+
+[baseline]
+enabled = false
+path = "reporigor-baseline.json"
 ```
 
 All documented sections and fields are optional. A missing section or field
@@ -121,10 +164,17 @@ that option permits recoverable syntax errors, not lossy source decoding.
 |---|---|---:|---|
 | `fail_over` | Non-negative finite number | `6.0` | Exit 2 when at least one known CRAP score is strictly greater than this value. |
 | `allow_missing_coverage` | Boolean | `false` | Permit functions that could not be matched to executable coverage lines. |
+| `unreported_as_zero` | Boolean | `false` | With region-aware coverage, score selected functions absent from the report as 0% instead of omitting them. |
 | `allow_empty` | Boolean | `false` | Permit a standalone `crap` run that discovers no functions. |
 
-CRAP uses `C² × (1 - coverage/100)³ + C`. Coverage is line coverage within the
-inclusive function line range. Supported inputs are LCOV, Cobertura XML,
+CRAP uses `C² × (1 - coverage/100)³ + C`. Coverage is executable-line coverage
+within the inclusive function line range after subtracting strict interiors of
+adapter-owned nested function/closure ranges. If nested and outer executable
+code share a boundary line, line-only ownership is ambiguous and RepoRigor
+omits that function's coverage and CRAP score rather than guessing. Sibling
+function ranges sharing a reported executable line are omitted for the same
+reason.
+Supported inputs are LCOV, Cobertura XML,
 coverage.py JSON, Istanbul JSON, and LLVM coverage-export JSON. `--coverage`
 may name a report file or a directory containing a conventionally named report.
 
@@ -161,11 +211,22 @@ unknown. The standalone `crap` command then exits 1 unless missing coverage is
 allowed. `check` reports the missing values but does not apply the standalone
 `allow_missing_coverage` or `allow_empty` guards.
 
+LLVM export JSON retains function regions and columns. RepoRigor assigns a
+region only when its complete span belongs to exactly one syntax-owned function
+and does not cross a nested executable boundary. With
+`unreported_as_zero = true`, a selected function that has no assigned region is
+scored conservatively as 0% covered. The backward-compatible default is
+`false`, which leaves it explicitly unscored; `allow_missing_coverage` still
+controls whether the standalone command permits that missing result.
+
 ### `[dry]`
 
 | Key | Type | Default | Meaning |
 |---|---|---:|---|
 | `min_tokens` | Integer, at least 4 | `30` | Smallest normalized token window considered a duplicate. |
+| `min_statements` | Positive integer | `5` | Minimum recursive statement count for function-level near-clone comparison. |
+| `similarity_threshold` | Finite number in `(0, 1]` | `0.92` | Minimum multiset Sørensen-Dice similarity that is reported as a clone. Equality is a finding. |
+| `shingle_tokens` | Integer in `1..=min_tokens` | `4` | Normalized-token shingle width used by function-level similarity. |
 | `max_groups` | Positive integer | `50` | Maximum duplicate groups retained after deterministic sorting. |
 | `max_occurrences_per_window` | Integer, at least 2 | `100` | Retain the earliest deterministic occurrences for one fingerprint; later occurrences are intentionally omitted. |
 | `max_total_windows` | Positive integer, at most `2000000` | `1000000` | Fail before indexing when selected token streams contain more minimum-size windows. |
@@ -173,25 +234,66 @@ allowed. `check` reports the missing values but does not apply the standalone
 | `max_candidate_work` | Positive integer, at most `25000000` | `10000000` | Fail when candidate dispatch, exact token comparison, and maximal extension exceed this many work units. |
 | `fail` | Boolean | `false` | Make standalone `dry` exit 2 when duplicates exist. |
 
-The `check` command always treats any retained duplicate group as a quality
-failure. It uses `max_groups` and `max_occurrences_per_window` from this section,
-but not `dry.fail`. Repository configuration can lower or raise the three work
-budgets only within their compiled ceilings. Budget exhaustion is an explicit
-operational error; it never returns a silently partial DRY result.
+Reliable functions with at least `min_tokens` normalized tokens and
+`min_statements` recursive statements are compared as multisets of
+`shingle_tokens`-wide shingles. For shingle multisets `A` and `B`, similarity is
+`2 * shared_occurrences / (|A| + |B|)`. Shared occurrences use multiset
+intersection, so repeats count only up to the smaller multiplicity. A pair is
+accepted when similarity is greater than or equal to `similarity_threshold`;
+connected accepted pairs form one canonical clone group whose reported
+similarity is the minimum accepted edge in that group. Exact normalized-token
+analysis remains the compatibility path for exact regions, including repeated
+blocks inside a function. `min_statements` applies only where an adapter owns a
+reliable recursive AST statement count; exact compatibility groups still use
+`min_tokens` and are gated rather than silently discarded.
+
+With baseline mode disabled, `check` treats every retained duplicate group as
+a quality failure. It uses `max_groups` and `max_occurrences_per_window` from
+this section, but not `dry.fail`. Repository configuration can lower or raise
+the three work budgets only within their compiled ceilings. Budget exhaustion
+is an explicit operational error; it never returns a silently partial DRY
+result.
 
 ### `[mutation]`
 
 | Key | Type | Default | Meaning |
 |---|---|---:|---|
 | `timeout_seconds` | Positive finite number | `120.0` | Timeout for each validation or test command. |
+| `minimum_score` | Finite number in `[0, 1]` | `0.80` | Minimum integrated mutation score. Equality passes. |
+| `operators` | Non-empty, duplicate-free array | all four fixed operators | Select from `boolean-literal`, `comparison`, `logical`, and `arithmetic`. |
+| `seed` | Unsigned 64-bit integer | `76412026` | Deterministic ordering seed applied to stable mutant fingerprints. |
+| `workers` | Integer exactly equal to `1` | `1` | The crash-safe executor is currently serial; any other value is rejected. |
 | `test_command` | String or omitted | omitted | Shell command run for the baseline and each executable mutant. |
 | `validation_command` | String or omitted | omitted | Optional build/type-check command run before the test command. |
 | `max_mutants` | Positive integer or omitted | omitted | Maximum selected candidates executed; remaining candidates are reported as ignored. |
 
-Commands are interpreted by the platform shell and run with the project root as
-their working directory. `mutate --run` and `check --run-mutations` require a
-non-empty test command, either on the CLI or in this section. Listing mutations
-never runs the configured commands.
+The integrated mutation score is `killed / (killed + survived)`. Exactly
+`killed` and `survived` are scoreable. `no-coverage`, `compile-error`,
+`runtime-error`, `timeout`, `invalid`, `ignored`, and `pending` are excluded;
+RepoRigor never guesses that a mutant is equivalent. When no scoreable status
+exists, the score check is explicitly omitted rather than reported as zero or
+as a pass. Each surviving mutant is also a separate structural failure with a
+stable fingerprint.
+
+The fixed operator set filters candidates before execution. The SHA-256 order
+key combines `seed` with each stable structural fingerprint, so input
+enumeration order does not affect which candidates reach `max_mutants`.
+Candidates beyond that executor-owned cap are `ignored` and therefore
+non-scoreable. A deterministic ignored tail does not make an otherwise
+scoreable capped run incomplete: the cap, seed, operators, and executed
+fingerprints are part of the rule evidence and analysis scope. Commands are
+interpreted by the platform shell and run with the project root as their
+working directory. `mutate --run` and
+`check --run-mutations` require a non-empty test command, either on the CLI or
+in this section. Listing mutations never runs the configured commands and
+produces only non-scoreable `pending` statuses.
+
+For each active mutant, RepoRigor sets `REPORIGOR_MUTANT_ID` and
+`REPORIGOR_MUTANT_FINGERPRINT` in both validation and test commands. Both are
+absent from baseline commands. Test tooling may use these values to select a
+fresh per-mutant build-cache directory; this prevents one compiled mutant from
+being reused while testing the next candidate. Dogfood clears its isolated
+cache before and after the run and assigns one cache directory per mutant.
 
 Execution mode acquires a global external-state lock before source analysis,
 recovers the selected root, writes a bounded recovery journal before an edit,
@@ -208,6 +310,174 @@ create that external coordination directory and shared lock but never recover
 a journal or modify project files. Multiple readers coexist; execution waits up
 to three seconds for transient readers before reporting a lock conflict. See
 [ARCHITECTURE.md](ARCHITECTURE.md#mutation-safety).
+
+### `[kiss]`
+
+| Key | Type | Default | Integrated measurement |
+|---|---|---:|---|
+| `maximum_cyclomatic_complexity` | Positive integer | `12` | One plus adapter-defined language decision points. |
+| `maximum_nesting_depth` | Non-negative integer | `5` | Maximum recursive AST control-flow nesting, excluding nested function boundaries. |
+| `maximum_function_statements` | Non-negative integer | `60` | Recursive AST statement-node count, excluding nested function boundaries. |
+| `maximum_parameters` | Non-negative integer | `6` | Declared function or method parameters, including an explicit receiver. |
+| `maximum_module_dependencies` | Non-negative integer | `16` | Distinct direct, non-target-gated production dependencies for a package. |
+
+These are inclusive maximums: `measured <= configured` passes. Function rules
+are emitted only for records whose adapter marked the recursive structural
+metrics reliable. The dependency-count rule requires a reliable project
+dependency graph.
+
+### `[yagni]`
+
+| Key | Type | Default | Integrated measurement |
+|---|---|---:|---|
+| `maximum_unused_private_functions` | Non-negative integer | `0` | Unambiguous private functions with no resolved same-package production reference and no adapter entry-point mark. |
+| `maximum_unused_modules` | Non-negative integer | `0` | Production modules with zero resolved references after conservative exclusions. |
+| `maximum_unused_production_dependencies` | Non-negative integer | `0` | Direct, non-target-gated production dependencies with neither a resolved production identifier reference nor feature activation. |
+| `maximum_unreachable_statements` | Non-negative integer | `0` | Statements after an unconditional `return`, `break`, or `continue` in the same recursive AST block. |
+| `maximum_unused_feature_flags` | Non-negative integer | `0` | Declared non-default features with no cfg, composition, or dependency-activation reference. |
+| `maximum_unreferenced_crate_exports` | Non-negative integer | `0` | Unambiguous repository-restricted exports with no resolved repository reference; unrestricted public API is excluded. |
+| `entry_points` | Duplicate-free array of non-empty strings | `["main", "build.rs"]` | Extra stable function/module symbols or path suffixes excluded from unused findings. |
+
+Each count is an inclusive maximum. Generated, target-gated,
+framework-managed, reflection-reachable, and externally invoked modules are
+excluded. The analysis also relies on adapter entry-point marks for functions;
+it does not treat unrestricted public symbols as dead merely because the
+selected repository contains no caller.
+
+### `[architecture]` and `[architecture.layers]`
+
+| Key | Type | Default | Meaning |
+|---|---|---:|---|
+| `maximum_module_fan_out` | Non-negative integer | `12` | Inclusive maximum for distinct direct, non-target-gated production dependencies. |
+| `forbidden_edges` | Duplicate-free array of `source->destination` patterns | `[]` | Reject matching internal production edges. Each side is exact or contains one `*` wildcard. |
+| `domain_modules` | Duplicate-free pattern array | `[]` | Sources in this set may not directly depend on `infrastructure_modules`. |
+| `infrastructure_modules` | Duplicate-free pattern array | `[]` | Destinations used by the domain rule. |
+| `interface_modules` | Duplicate-free pattern array | `[]` | Sources in this set may not directly depend on `implementation_modules`. |
+| `implementation_modules` | Duplicate-free pattern array | `[]` | Destinations used by the interface rule. |
+| `contract_traits` | Duplicate-free exact stable-symbol array | `[]` | Trait implementations that require a contract test. |
+| `contract_test_marker` | Non-empty canonical string | `"reporigor_contract"` | Required marker on a qualifying contract test. |
+| `architecture.layers` | Package-pattern-to-unsigned-integer map | `{}` | An internal edge passes when `source_layer >= destination_layer`; lower-numbered layers cannot depend on higher-numbered layers. A package matching multiple patterns is rejected as ambiguous. |
+
+Configured layer, edge, domain, and interface predicates use direct internal
+production edges and ignore target-gated edges. In addition to those predicates,
+the integrated check always detects cycles with Tarjan strongly connected
+components (including a self-edge), applies the fan-out maximum, and emits
+coupling metrics. A configured trait implementation passes its subtype-contract
+rule only when a non-target-gated test has `contract_test_marker` and references
+both the exact trait and implementation symbols.
+
+Coupling rows are informational and never fail by themselves. Afferent
+coupling `Ca` is the number of repository packages with a direct internal
+production dependency on a package. Efferent coupling `Ce` is the number of
+distinct direct production dependencies, internal or external. Instability is
+`Ce / (Ca + Ce)`, or `0` when both counts are zero.
+
+### `[cohesion]`
+
+| Key | Type | Default | Meaning |
+|---|---|---:|---|
+| `minimum` | Finite number in `[0, 1]` | `0.10` | Minimum module cohesion; equality passes. |
+
+Functions are grouped by repository-relative file plus the adapter-qualified
+module/type owner. A pair is related by a uniquely resolved direct function
+reference, a shared uniquely resolved local callee, a shared non-ubiquitous
+non-local reference, or membership in the same exact `(implementation type,
+trait)` contract. The trait relation applies only within that exact qualified
+implementation/trait owner; inherent methods are not related merely because
+they share a type. Ambiguous leaf names are not guessed. Cohesion is
+`related_pairs / all_function_pairs`; an owner with one function has cohesion
+`1.0`. The shared-reference test ignores `self`, `Self`, `Result`, `Option`,
+`Some`, `None`, `Ok`, `Err`, `new`, and `default`.
+
+### `[baseline]`
+
+| Key | Type | Default | Meaning |
+|---|---|---:|---|
+| `enabled` | Boolean | `false` | Compare the integrated rule stream with a prior native report. |
+| `path` | Safe repository-relative UTF-8 path | `"reporigor-baseline.json"` | Prior `ReportEnvelope` JSON to read from the analyzed root. Absolute paths and parent traversal are rejected. |
+
+There is no separate baseline schema. When enabled, `check` reads
+`results.rules` from the ordinary prior native report and matches rows by
+stable `violation_id`. The prior report's `results.rules.analysis_scope`
+fingerprint must exactly match the current backend/language/filter/test,
+coverage, Cargo-feature, mutation-execution, and normalized configuration
+selection; a mismatch is an operational error rather than an unsafe debt
+comparison. A current failure is `new` when its ID was absent,
+`worsened` when its finite `excess` is greater than the prior excess,
+`improved` when its excess is smaller, and otherwise `existing`. A previous
+failure that now passes is also `improved`; a previous failed ID that
+disappears is counted as `resolved` only when that rule was completely
+evaluated in the current run. Capability or partial-inventory omissions block
+resolution for their rule. With complete evidence, the baseline classification
+fails for `new` or `worsened` violations; existing debt remains visible without
+failing it. Independently, any nonempty `results.rules.omitted` list makes
+`results.rules.baseline.gate_passed` false and makes `check` exit 2.
+
+`check` is read-only with respect to the configured baseline: it never creates,
+updates, or rewrites the prior report. The prior report is bounded by
+`max_source_bytes`. Missing, unreadable, malformed, oversized, or non-native
+reports, and native reports without integrated rule rows, are operational
+errors. Creating or replacing the checked-in baseline is therefore an explicit
+user action outside the check.
+
+### Capability-gated omissions
+
+Structural absence is never converted into a zero measurement or a successful
+rule. The native report records the rule ID and reason in `results.rules.omitted`:
+
+- CRAP is omitted when no function-level coverage score exists and the explicit
+  `unreported_as_zero` policy is disabled.
+- Function KISS metrics and cohesion are emitted only for reliable adapter
+  structural records. Enhanced function DRY likewise considers only reliable
+  records, while exact token DRY remains available as a fallback.
+- Package dependency counts, direction/edge/cycle rules, fan-out, and coupling
+  require a reliable production dependency graph.
+- Unused private functions, repository-restricted exports, and production
+  dependencies require reliable whole-project identifier counts. Unused
+  modules, unreachable statements, and feature flags each require their own
+  reliable inventory.
+- Configured subtype-contract checks require both reliable trait-implementation
+  and test-reference inventories.
+- Mutation score is omitted unless at least one result is `killed` or
+  `survived`.
+
+Omitted rules are neither pass nor failure rows. They still make the integrated
+result incomplete: one or more entries in `results.rules.omitted` force
+`results.rules.baseline.gate_passed` to `false` and make `check` exit 2, whether
+baseline mode is enabled or disabled. Baseline resolution also ignores a
+previously failed rule when that rule was not evaluated, preventing a weaker
+adapter from manufacturing an apparent improvement.
+
+### Integrated rule catalog
+
+| Rule ID | Comparison and evidence |
+|---|---|
+| `crap.maximum` | Inclusive maximum `crap.fail_over`; measured CRAP is `C² × (1 - coverage_fraction)³ + C`. |
+| `dry.clone` | Exclusive maximum against `dry.similarity_threshold`, so similarity equal to the threshold fails. |
+| `mutation.score` | Inclusive minimum `mutation.minimum_score`; measured fraction uses only killed and survived results. |
+| `mutation.surviving-mutant` | Failed boolean row for each survivor; structural evidence is its stable fingerprint. |
+| `kiss.cyclomatic-complexity` | Inclusive maximum per reliable function. |
+| `kiss.nesting-depth` | Inclusive maximum per reliable function. |
+| `kiss.function-statements` | Inclusive maximum per reliable function. |
+| `kiss.parameter-count` | Inclusive maximum per reliable function. |
+| `kiss.module-dependency-count` | Inclusive maximum per package. |
+| `yagni.unused-private-function` | Inclusive maximum total unused count, emitted at each unambiguous finding. |
+| `yagni.unused-module` | Inclusive maximum total unused count. |
+| `yagni.unused-production-dependency` | Inclusive maximum total unused count. |
+| `yagni.unreachable-code` | Inclusive maximum total unreachable count. |
+| `yagni.unused-feature-flag` | Inclusive maximum total unused count. |
+| `yagni.unreferenced-crate-export` | Inclusive maximum total unreferenced count. |
+| `solid.dependency-direction` | Boolean per configured internal layer edge. |
+| `solid.forbidden-module-edge` | Boolean per internal production edge. |
+| `solid.domain-to-infrastructure` | Boolean per internal production edge. |
+| `solid.interface-to-implementation` | Boolean per internal production edge. |
+| `solid.package-cycle` | Failed boolean row per internal production strongly connected component. |
+| `solid.maximum-module-fan-out` | Inclusive maximum per package. |
+| `solid.subtype-contract-test` | Boolean per configured non-target-gated trait implementation. |
+| `coupling.afferent` | Informational `Ca` per package. |
+| `coupling.efferent` | Informational `Ce` per package. |
+| `coupling.instability` | Informational `Ce / (Ca + Ce)` per package. |
+| `cohesion.module` | Inclusive minimum related-pair fraction per module; methods in the same exact implementation/trait contract are related. |
 
 ## Precedence
 
@@ -327,8 +597,12 @@ reporigor [GLOBAL OPTIONS] check [PATH]
   [--test-command COMMAND]
 ```
 
-`check` analyzes the project once and produces CRAP, DRY, and mutation sections.
-Mutation is inventory-only unless `--run-mutations` is present.
+`check` analyzes the project once and produces the existing CRAP, DRY, and
+mutation sections plus the canonical `results.rules` stream for CRAP, DRY,
+mutation quality, KISS, YAGNI, dependency/SOLID predicates, coupling, and
+cohesion. Mutation is inventory-only unless `--run-mutations` is present; its
+`pending` inventory is non-scoreable, so mutation score is then listed as an
+omitted check.
 
 ### `providers`
 
@@ -346,7 +620,7 @@ version/configuration probes. See [PROVIDERS.md](PROVIDERS.md).
 |---|---|---|
 | `text` | Terminal and plain CI logs | All commands |
 | `json` | Lossless deterministic native schema v1 | All commands |
-| `sarif` | Static-analysis import for CRAP and DRY findings | `crap`, `dry`, `check` |
+| `sarif` | Static-analysis import for CRAP, DRY, and failed integrated rule rows | `crap`, `dry`, `check` |
 | `mutation-json` | Mutation Testing Elements v2 | `mutate`, `check` |
 
 `providers --format json` emits provider-resolution JSON rather than the native
@@ -357,14 +631,17 @@ Native analysis JSON has this top-level shape:
 
 ```text
 schema_version, tool, command, root, summary,
-backends[], diagnostics[], results { crap?, dry?, mutate? }
+backends[], diagnostics[], results { crap?, dry?, mutate?, rules? }
 ```
 
-The native schema is lossless. SARIF intentionally excludes mutation results;
-Mutation Testing Elements intentionally excludes CRAP and DRY results. Invalid
-command/format combinations are rejected before analysis. All JSON output is
-pretty-printed, newline-terminated, and deterministically ordered for equivalent
-input.
+The integrated `rules` section contains the formula catalog, summary counts,
+canonical rule rows, surviving-mutant fingerprints, explicit omissions, and
+baseline comparison metadata. The native schema is lossless. SARIF projects
+failed rule rows but intentionally excludes mutation execution records;
+Mutation Testing Elements intentionally excludes CRAP, DRY, and structural rule
+details. Invalid command/format combinations are rejected before analysis. All
+JSON output is pretty-printed, newline-terminated, and deterministically ordered
+for equivalent input. See [the schema guide](../schemas/README.md).
 
 ## Exit codes
 
@@ -374,8 +651,13 @@ input.
 | `1` | Operational/configuration/backend/parse failure, standalone CRAP missing-data guard, or disallowed mutation execution error. |
 | `2` | Quality gate failure. |
 
-Quality exit 2 is produced by CRAP scores strictly over the limit, DRY findings
-when gating is active, or disallowed surviving mutants. Mutation invalid,
+For standalone commands, quality exit 2 retains the documented CRAP, DRY, and
+survivor policies. For `check`, baseline-disabled mode exits 2 for any failed
+integrated rule. With complete evidence, baseline-enabled mode exits 2 for
+`new` or `worsened` failures; existing debt, improvements, resolutions, and
+informational metrics remain visible without failing that gate. In either
+baseline mode, any nonempty `results.rules.omitted` list makes
+`results.rules.baseline.gate_passed` false and exits 2. Mutation invalid,
 runtime-error, timeout, and disallowed compile-error states take precedence and
 produce exit 1.
 

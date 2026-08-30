@@ -8,98 +8,108 @@ use crate::scope::CfgContext;
 
 pub(crate) fn item_attrs(item: &Item) -> &[Attribute] {
     match item {
-        Item::Const(value) => &value.attrs,
-        Item::Enum(value) => &value.attrs,
-        Item::ExternCrate(value) => &value.attrs,
-        Item::Fn(value) => &value.attrs,
-        Item::ForeignMod(value) => &value.attrs,
-        Item::Impl(value) => &value.attrs,
-        Item::Macro(value) => &value.attrs,
-        Item::Mod(value) => &value.attrs,
-        Item::Static(value) => &value.attrs,
-        Item::Struct(value) => &value.attrs,
-        Item::Trait(value) => &value.attrs,
-        Item::TraitAlias(value) => &value.attrs,
-        Item::Type(value) => &value.attrs,
-        Item::Union(value) => &value.attrs,
-        Item::Use(value) => &value.attrs,
-        _ => &[],
+        Item::Const(syn::ItemConst { attrs, .. })
+        | Item::Enum(syn::ItemEnum { attrs, .. })
+        | Item::ExternCrate(syn::ItemExternCrate { attrs, .. })
+        | Item::Fn(syn::ItemFn { attrs, .. })
+        | Item::ForeignMod(syn::ItemForeignMod { attrs, .. })
+        | Item::Impl(syn::ItemImpl { attrs, .. })
+        | Item::Macro(syn::ItemMacro { attrs, .. })
+        | Item::Mod(syn::ItemMod { attrs, .. })
+        | Item::Static(syn::ItemStatic { attrs, .. })
+        | Item::Struct(syn::ItemStruct { attrs, .. })
+        | Item::Trait(syn::ItemTrait { attrs, .. })
+        | Item::TraitAlias(syn::ItemTraitAlias { attrs, .. })
+        | Item::Type(syn::ItemType { attrs, .. })
+        | Item::Union(syn::ItemUnion { attrs, .. })
+        | Item::Use(syn::ItemUse { attrs, .. }) => attrs,
+        _ => empty_attributes(),
     }
 }
 
 pub(crate) fn impl_item_attrs(item: &ImplItem) -> &[Attribute] {
     match item {
-        ImplItem::Const(value) => &value.attrs,
-        ImplItem::Fn(value) => &value.attrs,
-        ImplItem::Type(value) => &value.attrs,
-        ImplItem::Macro(value) => &value.attrs,
-        _ => &[],
+        ImplItem::Const(syn::ImplItemConst { attrs, .. })
+        | ImplItem::Fn(syn::ImplItemFn { attrs, .. })
+        | ImplItem::Type(syn::ImplItemType { attrs, .. })
+        | ImplItem::Macro(syn::ImplItemMacro { attrs, .. }) => attrs,
+        _ => empty_attributes(),
     }
 }
 
 pub(crate) fn trait_item_attrs(item: &TraitItem) -> &[Attribute] {
     match item {
-        TraitItem::Const(value) => &value.attrs,
-        TraitItem::Fn(value) => &value.attrs,
-        TraitItem::Type(value) => &value.attrs,
-        TraitItem::Macro(value) => &value.attrs,
-        _ => &[],
+        TraitItem::Const(syn::TraitItemConst { attrs, .. })
+        | TraitItem::Fn(syn::TraitItemFn { attrs, .. })
+        | TraitItem::Type(syn::TraitItemType { attrs, .. })
+        | TraitItem::Macro(syn::TraitItemMacro { attrs, .. }) => attrs,
+        _ => empty_attributes(),
     }
 }
 
 pub(crate) fn foreign_item_attrs(item: &ForeignItem) -> &[Attribute] {
     match item {
-        ForeignItem::Fn(value) => &value.attrs,
-        ForeignItem::Static(value) => &value.attrs,
-        ForeignItem::Type(value) => &value.attrs,
-        ForeignItem::Macro(value) => &value.attrs,
-        _ => &[],
+        ForeignItem::Fn(syn::ForeignItemFn { attrs, .. })
+        | ForeignItem::Static(syn::ForeignItemStatic { attrs, .. })
+        | ForeignItem::Type(syn::ForeignItemType { attrs, .. })
+        | ForeignItem::Macro(syn::ForeignItemMacro { attrs, .. }) => attrs,
+        _ => empty_attributes(),
     }
 }
 
 pub(crate) fn expr_attrs(expr: &Expr) -> &[Attribute] {
     match expr {
-        Expr::Array(value) => &value.attrs,
-        Expr::Assign(value) => &value.attrs,
-        Expr::Async(value) => &value.attrs,
-        Expr::Await(value) => &value.attrs,
-        Expr::Binary(value) => &value.attrs,
-        Expr::Block(value) => &value.attrs,
-        Expr::Break(value) => &value.attrs,
-        Expr::Call(value) => &value.attrs,
-        Expr::Cast(value) => &value.attrs,
-        Expr::Closure(value) => &value.attrs,
-        Expr::Const(value) => &value.attrs,
-        Expr::Continue(value) => &value.attrs,
-        Expr::Field(value) => &value.attrs,
-        Expr::ForLoop(value) => &value.attrs,
-        Expr::Group(value) => &value.attrs,
-        Expr::If(value) => &value.attrs,
-        Expr::Index(value) => &value.attrs,
-        Expr::Infer(value) => &value.attrs,
-        Expr::Let(value) => &value.attrs,
-        Expr::Lit(value) => &value.attrs,
-        Expr::Loop(value) => &value.attrs,
-        Expr::Macro(value) => &value.attrs,
-        Expr::Match(value) => &value.attrs,
-        Expr::MethodCall(value) => &value.attrs,
-        Expr::Paren(value) => &value.attrs,
-        Expr::Path(value) => &value.attrs,
-        Expr::Range(value) => &value.attrs,
-        Expr::RawAddr(value) => &value.attrs,
-        Expr::Reference(value) => &value.attrs,
-        Expr::Repeat(value) => &value.attrs,
-        Expr::Return(value) => &value.attrs,
-        Expr::Struct(value) => &value.attrs,
-        Expr::Try(value) => &value.attrs,
-        Expr::TryBlock(value) => &value.attrs,
-        Expr::Tuple(value) => &value.attrs,
-        Expr::Unary(value) => &value.attrs,
-        Expr::Unsafe(value) => &value.attrs,
-        Expr::While(value) => &value.attrs,
-        Expr::Yield(value) => &value.attrs,
-        _ => &[],
+        Expr::Array(syn::ExprArray { attrs, .. })
+        | Expr::Assign(syn::ExprAssign { attrs, .. })
+        | Expr::Async(syn::ExprAsync { attrs, .. })
+        | Expr::Await(syn::ExprAwait { attrs, .. })
+        | Expr::Binary(syn::ExprBinary { attrs, .. })
+        | Expr::Block(syn::ExprBlock { attrs, .. })
+        | Expr::Break(syn::ExprBreak { attrs, .. })
+        | Expr::Call(syn::ExprCall { attrs, .. })
+        | Expr::Cast(syn::ExprCast { attrs, .. })
+        | Expr::Closure(syn::ExprClosure { attrs, .. })
+        | Expr::Const(syn::ExprConst { attrs, .. })
+        | Expr::Continue(syn::ExprContinue { attrs, .. })
+        | Expr::Field(syn::ExprField { attrs, .. })
+        | Expr::ForLoop(syn::ExprForLoop { attrs, .. })
+        | Expr::Group(syn::ExprGroup { attrs, .. })
+        | Expr::If(syn::ExprIf { attrs, .. })
+        | Expr::Index(syn::ExprIndex { attrs, .. })
+        | Expr::Infer(syn::ExprInfer { attrs, .. })
+        | Expr::Let(syn::ExprLet { attrs, .. })
+        | Expr::Lit(syn::ExprLit { attrs, .. })
+        | Expr::Loop(syn::ExprLoop { attrs, .. })
+        | Expr::Macro(syn::ExprMacro { attrs, .. })
+        | Expr::Match(syn::ExprMatch { attrs, .. })
+        | Expr::MethodCall(syn::ExprMethodCall { attrs, .. })
+        | Expr::Paren(syn::ExprParen { attrs, .. })
+        | Expr::Path(syn::ExprPath { attrs, .. })
+        | Expr::Range(syn::ExprRange { attrs, .. })
+        | Expr::RawAddr(syn::ExprRawAddr { attrs, .. })
+        | Expr::Reference(syn::ExprReference { attrs, .. })
+        | Expr::Repeat(syn::ExprRepeat { attrs, .. })
+        | Expr::Return(syn::ExprReturn { attrs, .. })
+        | Expr::Struct(syn::ExprStruct { attrs, .. })
+        | Expr::Try(syn::ExprTry { attrs, .. })
+        | Expr::TryBlock(syn::ExprTryBlock { attrs, .. })
+        | Expr::Tuple(syn::ExprTuple { attrs, .. })
+        | Expr::Unary(syn::ExprUnary { attrs, .. })
+        | Expr::Unsafe(syn::ExprUnsafe { attrs, .. })
+        | Expr::While(syn::ExprWhile { attrs, .. })
+        | Expr::Yield(syn::ExprYield { attrs, .. }) => attrs,
+        _ => empty_attributes(),
     }
+}
+
+pub(crate) fn attributes_contain(attributes: &[Attribute], names: &[&str]) -> bool {
+    attributes
+        .iter()
+        .any(|attribute| names.iter().any(|name| attribute.path().is_ident(name)))
+}
+
+fn empty_attributes() -> &'static [Attribute] {
+    &[]
 }
 
 fn range_with_attrs(attrs: &[Attribute], node: &impl Spanned) -> Range<usize> {
@@ -110,23 +120,29 @@ fn range_with_attrs(attrs: &[Attribute], node: &impl Spanned) -> Range<usize> {
     start..range.end
 }
 
-struct InactiveRangeVisitor<'a> {
-    cfg: &'a CfgContext,
+struct AttributeRangeVisitor<F> {
+    excluded: F,
     ranges: Vec<Range<usize>>,
 }
 
-impl InactiveRangeVisitor<'_> {
+impl<F> AttributeRangeVisitor<F>
+where
+    F: FnMut(&[Attribute]) -> bool,
+{
     fn inactive(&mut self, attrs: &[Attribute], node: &impl Spanned) -> bool {
-        if self.cfg.attrs_active(attrs) {
-            false
-        } else {
+        if (self.excluded)(attrs) {
             self.ranges.push(range_with_attrs(attrs, node));
             true
+        } else {
+            false
         }
     }
 }
 
-impl<'ast> Visit<'ast> for InactiveRangeVisitor<'_> {
+impl<'ast, F> Visit<'ast> for AttributeRangeVisitor<F>
+where
+    F: FnMut(&[Attribute]) -> bool,
+{
     fn visit_item(&mut self, node: &'ast Item) {
         if !self.inactive(item_attrs(node), node) {
             visit::visit_item(self, node);
@@ -194,12 +210,29 @@ impl<'ast> Visit<'ast> for InactiveRangeVisitor<'_> {
     }
 }
 
-pub(crate) fn inactive_file_ranges(file: &syn::File, cfg: &CfgContext) -> Vec<Range<usize>> {
-    let mut visitor = InactiveRangeVisitor {
-        cfg,
+#[derive(Clone, Copy)]
+pub(crate) enum AttributeRangeRoot<'a> {
+    Block(&'a syn::Block),
+    File(&'a syn::File),
+}
+
+pub(crate) fn attribute_ranges(
+    root: AttributeRangeRoot<'_>,
+    excluded: impl FnMut(&[Attribute]) -> bool,
+) -> Vec<Range<usize>> {
+    let mut visitor = AttributeRangeVisitor {
+        excluded,
         ranges: Vec::new(),
     };
-    visitor.visit_file(file);
-    visitor.ranges.sort_by_key(|range| (range.start, range.end));
+    match root {
+        AttributeRangeRoot::Block(block) => visitor.visit_block(block),
+        AttributeRangeRoot::File(file) => visitor.visit_file(file),
+    }
     visitor.ranges
+}
+
+pub(crate) fn inactive_file_ranges(file: &syn::File, cfg: &CfgContext) -> Vec<Range<usize>> {
+    let mut ranges = attribute_ranges(AttributeRangeRoot::File(file), |attrs| !cfg.attrs_active(attrs));
+    ranges.sort_by_key(|range| (range.start, range.end));
+    ranges
 }

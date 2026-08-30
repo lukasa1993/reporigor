@@ -1,9 +1,11 @@
-use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::Read;
-use std::mem;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+use std::{
+    collections::BTreeMap,
+    fs::File,
+    io::Read,
+    mem,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use reporigor_core::{
     AnalysisRequest, AnalysisSnapshot, CoreError, Diagnostic, FunctionRecord, Severity, SourceFile,
@@ -22,38 +24,46 @@ const MAX_AST_LINE_START_CACHE_BYTES: usize = 64 * 1024 * 1024;
 
 /// Result of the JSON AST command for one compilation-database entry.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[must_use]
 pub enum AstDumpStatus {
     Analyzed,
     CommandFailed { exit_code: Option<i32>, stderr: String },
-    TimedOut { timeout: Duration, stderr: String },
-    Unavailable { message: String },
     Rejected { message: String },
+    TimedOut { stderr: String, timeout: Duration },
     OutputTooLarge { limit: usize },
+    Unavailable { message: String },
     InvalidJson { message: String },
     NotRun { message: String },
 }
 
 /// Native AST extraction provenance for one translation unit.
 #[derive(Debug, Clone)]
+#[must_use = "inspect the AST provenance and extracted functions"]
 pub struct AstTranslationUnit {
+    #[doc = "Zero-based index of the originating compilation-database entry."]
     pub command_index: usize,
     pub command: CompileCommand,
+    #[doc = "Canonical source selected for AST extraction, when available."]
     pub source: Option<SourceFile>,
     pub language: Option<ClangLanguage>,
+    #[doc = "Exact sanitized compiler invocation used for extraction."]
     pub invocation: Option<SanitizedCommand>,
     pub status: AstDumpStatus,
+    /// Wall-clock time spent on the AST command.
     pub elapsed: Duration,
     pub stderr: String,
+    /// Functions extracted from this translation unit.
     pub functions: Vec<FunctionRecord>,
 }
 
 /// Standard analysis output plus the compilation database, validation records,
 /// and exact JSON AST command provenance used to produce it.
 #[derive(Debug, Clone)]
+#[must_use]
 pub struct ClangAnalysis {
+    pub translation_units: Vec<AstTranslationUnit>,
     pub snapshot: AnalysisSnapshot,
     pub project: ClangProject,
-    pub translation_units: Vec<AstTranslationUnit>,
 }
 
 impl ClangAdapter {
@@ -70,65 +80,7 @@ impl ClangAdapter {
         request: &AnalysisRequest,
     ) -> Result<ClangAnalysis, CoreError> {
         let project = self.validate_project(request)?;
-        let mut snapshot = AnalysisSnapshot {
-            files: project.context.sources.clone(),
-            backends: project.context.backends.clone(),
-            diagnostics: project.context.diagnostics.clone(),
-            ..AnalysisSnapshot::default()
-        };
-        let mut records = BTreeMap::<FunctionKey, FunctionRecord>::new();
-        let mut ast_units = Vec::with_capacity(project.translation_units.len());
-
-        for unit in &project.translation_units {
-            let Some(source) = unit.source.as_ref() else {
-                ast_units.push(not_run(unit, "translation unit was not selected for analysis"));
-                continue;
-            };
-            let Some(language) = unit.language else {
-                ast_units.push(not_run(unit, "translation unit language is unknown"));
-                continue;
-            };
-            if !validation_allows_ast(&unit.status) {
-                snapshot.parse_errors = snapshot.parse_errors.saturating_add(1);
-                ast_units.push(not_run(
-                    unit,
-                    "Clang syntax validation did not succeed; JSON AST was not requested",
-                ));
-                continue;
-            }
-
-            let ast_unit = dump_translation_unit(
-                unit.command_index,
-                &unit.command,
-                source,
-                language,
-                self.compiler(),
-                self.timeout(),
-                self.ast_output_limit(),
-                &project.context.root,
-            );
-            if ast_unit.status != AstDumpStatus::Analyzed {
-                snapshot.parse_errors = snapshot.parse_errors.saturating_add(1);
-                snapshot
-                    .diagnostics
-                    .push(ast_diagnostic(source, unit.command_index, &ast_unit.status));
-            }
-            for function in &ast_unit.functions {
-                let key = FunctionKey::from(function);
-                records
-                    .entry(key)
-                    .and_modify(|record| record.complexity = record.complexity.max(function.complexity))
-                    .or_insert_with(|| function.clone());
-            }
-            ast_units.push(ast_unit);
-        }
-
-        snapshot.functions = records.into_values().collect();
-        Ok(ClangAnalysis {
-            snapshot,
-            project,
-            translation_units: ast_units,
-        })
+        Ok(AstAnalysisState::new(&project).analyze(self, project))
     }
 
     /// Extract native Clang functions and complexity into the shared analysis
@@ -142,6 +94,100 @@ impl ClangAdapter {
     pub fn analyze_project(&self, request: &AnalysisRequest) -> Result<AnalysisSnapshot, CoreError> {
         self.analyze_project_with_provenance(request)
             .map(|analysis| analysis.snapshot)
+    }
+}
+
+struct AstAnalysisState {
+    snapshot: AnalysisSnapshot,
+    records: BTreeMap<(String, String), FunctionRecord>,
+    translation_units: Vec<AstTranslationUnit>,
+}
+
+impl AstAnalysisState {
+    fn new(project: &ClangProject) -> Self {
+        Self {
+            snapshot: AnalysisSnapshot {
+                files: project.context.sources.clone(),
+                backends: project.context.backends.clone(),
+                diagnostics: project.context.diagnostics.clone(),
+                ..AnalysisSnapshot::default()
+            },
+            records: BTreeMap::new(),
+            translation_units: Vec::with_capacity(project.translation_units.len()),
+        }
+    }
+
+    fn analyze(mut self, adapter: &ClangAdapter, project: ClangProject) -> ClangAnalysis {
+        for unit in &project.translation_units {
+            self.analyze_unit(adapter, &project, unit);
+        }
+        self.snapshot.functions = self.records.into_values().collect();
+        ClangAnalysis {
+            snapshot: self.snapshot,
+            project,
+            translation_units: self.translation_units,
+        }
+    }
+
+    fn analyze_unit(
+        &mut self,
+        adapter: &ClangAdapter,
+        project: &ClangProject,
+        unit: &crate::TranslationUnit,
+    ) {
+        let Some(source) = unit.source.as_ref() else {
+            self.translation_units
+                .push(not_run(unit, "translation unit was not selected for analysis"));
+            return;
+        };
+        let Some(language) = unit.language else {
+            self.translation_units
+                .push(not_run(unit, "translation unit language is unknown"));
+            return;
+        };
+        if !validation_allows_ast(&unit.status) {
+            self.record_not_run(unit);
+            return;
+        }
+        let ast_unit = dump_translation_unit(&AstDumpRequest {
+            command_index: unit.command_index,
+            command: &unit.command,
+            source,
+            language,
+            compiler: adapter.compiler(),
+            timeout: adapter.timeout(),
+            output_limit: adapter.ast_output_limit(),
+            root: &project.context.root,
+        });
+        self.record_dump(source, ast_unit);
+    }
+
+    fn record_not_run(&mut self, unit: &crate::TranslationUnit) {
+        self.snapshot.parse_errors = self.snapshot.parse_errors.saturating_add(1);
+        self.translation_units.push(not_run(
+            unit,
+            "Clang syntax validation did not succeed; JSON AST was not requested",
+        ));
+    }
+
+    fn record_dump(&mut self, source: &SourceFile, ast_unit: AstTranslationUnit) {
+        if ast_unit.status != AstDumpStatus::Analyzed {
+            self.snapshot.parse_errors = self.snapshot.parse_errors.saturating_add(1);
+            self.snapshot
+                .diagnostics
+                .push(ast_diagnostic(source, ast_unit.command_index, &ast_unit.status));
+        }
+        for function in &ast_unit.functions {
+            self.merge_function(function);
+        }
+        self.translation_units.push(ast_unit);
+    }
+
+    fn merge_function(&mut self, function: &FunctionRecord) {
+        self.records
+            .entry((function.file.clone(), function.stable_symbol.clone()))
+            .and_modify(|record| record.complexity = record.complexity.max(function.complexity))
+            .or_insert_with(|| function.clone());
     }
 }
 
@@ -168,113 +214,154 @@ fn not_run(unit: &crate::TranslationUnit, message: &str) -> AstTranslationUnit {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-fn dump_translation_unit(
+struct AstDumpRequest<'a> {
     command_index: usize,
-    command: &CompileCommand,
-    source: &SourceFile,
+    command: &'a CompileCommand,
+    source: &'a SourceFile,
     language: ClangLanguage,
-    compiler: &Path,
+    compiler: &'a Path,
     timeout: Duration,
     output_limit: usize,
-    root: &Path,
-) -> AstTranslationUnit {
-    let mut invocation = match ast_dump_command(command, compiler, language) {
+    root: &'a Path,
+}
+
+fn dump_translation_unit(request: &AstDumpRequest<'_>) -> AstTranslationUnit {
+    let mut invocation = match ast_dump_command(request.command, request.compiler, request.language) {
         Ok(invocation) => invocation,
-        Err(error) => {
-            return AstTranslationUnit {
-                command_index,
-                command: command.clone(),
-                source: Some(source.clone()),
-                language: Some(language),
-                invocation: None,
-                status: AstDumpStatus::Rejected {
-                    message: error.to_string(),
-                },
-                elapsed: Duration::ZERO,
-                stderr: String::new(),
-                functions: Vec::new(),
-            };
-        }
+        Err(error) => return rejected_dump(request, error.to_string()),
     };
     add_ast_dump_flags(&mut invocation);
     let started = Instant::now();
-    let outcome = run_bounded_capture(&invocation, timeout, Some(output_limit), AST_STDERR_LIMIT);
+    let outcome = run_bounded_capture(
+        &invocation,
+        request.timeout,
+        Some(request.output_limit),
+        AST_STDERR_LIMIT,
+    );
     let elapsed = started.elapsed();
+    let output = interpret_outcome(outcome, request);
+    completed_dump(request, Some(invocation), elapsed, output)
+}
 
-    let (status, stderr, functions) = match outcome {
+fn rejected_dump(request: &AstDumpRequest<'_>, message: String) -> AstTranslationUnit {
+    completed_dump(
+        request,
+        None,
+        Duration::ZERO,
+        AstDumpOutput {
+            status: AstDumpStatus::Rejected { message },
+            stderr: String::new(),
+            functions: Vec::new(),
+        },
+    )
+}
+
+struct AstDumpOutput {
+    status: AstDumpStatus,
+    stderr: String,
+    functions: Vec<FunctionRecord>,
+}
+
+fn interpret_outcome(outcome: ProcessOutcome, request: &AstDumpRequest<'_>) -> AstDumpOutput {
+    match outcome {
         ProcessOutcome::Exited {
-            success: false,
+            success,
             exit_code,
-            stderr,
-            ..
-        } => (
-            AstDumpStatus::CommandFailed {
-                exit_code,
-                stderr: annotate_truncation(stderr.text.clone(), stderr.truncated),
-            },
-            annotate_truncation(stderr.text, stderr.truncated),
-            Vec::new(),
-        ),
-        ProcessOutcome::Exited {
-            success: true,
             stdout,
             stderr,
-            ..
-        } if stdout.truncated => (
-            AstDumpStatus::OutputTooLarge { limit: output_limit },
-            annotate_truncation(stderr.text, stderr.truncated),
-            Vec::new(),
-        ),
-        ProcessOutcome::Exited {
-            success: true,
-            stdout,
-            stderr,
-            ..
-        } => {
-            let stderr_text = annotate_truncation(stderr.text, stderr.truncated);
-            match parse_ast(&stdout.text) {
-                Ok(ast) => (
-                    AstDumpStatus::Analyzed,
-                    stderr_text,
-                    extract_functions(&ast, root, command, source, language),
-                ),
-                Err(error) => (
-                    AstDumpStatus::InvalidJson {
-                        message: error.to_string(),
-                    },
-                    stderr_text,
-                    Vec::new(),
-                ),
-            }
-        }
-        ProcessOutcome::TimedOut { stderr } => (
-            AstDumpStatus::TimedOut {
-                timeout,
-                stderr: annotate_truncation(stderr.text.clone(), stderr.truncated),
-            },
-            annotate_truncation(stderr.text, stderr.truncated),
-            Vec::new(),
-        ),
-        ProcessOutcome::Unavailable(message) => (
-            AstDumpStatus::Unavailable {
+        } => interpret_exit(success, exit_code, &stdout, stderr, request),
+        ProcessOutcome::TimedOut { stderr } => timed_out_dump(stderr, request.timeout),
+        ProcessOutcome::Unavailable(message) => AstDumpOutput {
+            status: AstDumpStatus::Unavailable {
                 message: message.clone(),
             },
-            message,
-            Vec::new(),
-        ),
-    };
+            stderr: message,
+            functions: Vec::new(),
+        },
+    }
+}
 
-    AstTranslationUnit {
-        command_index,
-        command: command.clone(),
-        source: Some(source.clone()),
-        language: Some(language),
-        invocation: Some(invocation),
-        status,
-        elapsed,
+fn interpret_exit(
+    success: bool,
+    exit_code: Option<i32>,
+    stdout: &crate::validation::CapturedOutput,
+    stderr: crate::validation::CapturedOutput,
+    request: &AstDumpRequest<'_>,
+) -> AstDumpOutput {
+    let stderr_text = annotate_truncation(stderr.text, stderr.truncated);
+    if !success {
+        return AstDumpOutput {
+            status: AstDumpStatus::CommandFailed {
+                exit_code,
+                stderr: stderr_text.clone(),
+            },
+            stderr: stderr_text,
+            functions: Vec::new(),
+        };
+    }
+    if stdout.truncated {
+        return AstDumpOutput {
+            status: AstDumpStatus::OutputTooLarge {
+                limit: request.output_limit,
+            },
+            stderr: stderr_text,
+            functions: Vec::new(),
+        };
+    }
+    parse_dump(&stdout.text, stderr_text, request)
+}
+
+fn parse_dump(json: &str, stderr: String, request: &AstDumpRequest<'_>) -> AstDumpOutput {
+    match parse_ast(json) {
+        Ok(ast) => AstDumpOutput {
+            status: AstDumpStatus::Analyzed,
+            stderr,
+            functions: extract_functions(
+                &ast,
+                request.root,
+                request.command,
+                request.source,
+                request.language,
+            ),
+        },
+        Err(error) => AstDumpOutput {
+            status: AstDumpStatus::InvalidJson {
+                message: error.to_string(),
+            },
+            stderr,
+            functions: Vec::new(),
+        },
+    }
+}
+
+fn timed_out_dump(stderr: crate::validation::CapturedOutput, timeout: Duration) -> AstDumpOutput {
+    let stderr = annotate_truncation(stderr.text, stderr.truncated);
+    AstDumpOutput {
+        status: AstDumpStatus::TimedOut {
+            timeout,
+            stderr: stderr.clone(),
+        },
         stderr,
-        functions,
+        functions: Vec::new(),
+    }
+}
+
+fn completed_dump(
+    request: &AstDumpRequest<'_>,
+    invocation: Option<SanitizedCommand>,
+    elapsed: Duration,
+    output: AstDumpOutput,
+) -> AstTranslationUnit {
+    AstTranslationUnit {
+        command_index: request.command_index,
+        command: request.command.clone(),
+        source: Some(request.source.clone()),
+        language: Some(request.language),
+        invocation,
+        status: output.status,
+        elapsed,
+        stderr: output.stderr,
+        functions: output.functions,
     }
 }
 
@@ -313,7 +400,17 @@ fn annotate_truncation(mut value: String, truncated: bool) -> String {
 }
 
 fn ast_diagnostic(source: &SourceFile, command_index: usize, status: &AstDumpStatus) -> Diagnostic {
-    let message = match status {
+    Diagnostic {
+        severity: Severity::Error,
+        backend: "clang".to_string(),
+        message: ast_status_message(source, command_index, status),
+        location: None,
+        fallback_used: false,
+    }
+}
+
+fn ast_status_message(source: &SourceFile, command_index: usize, status: &AstDumpStatus) -> String {
+    match status {
         AstDumpStatus::Analyzed => format!("Clang analyzed {}", source.relative),
         AstDumpStatus::CommandFailed { exit_code, stderr } => format!(
             "Clang JSON AST failed for {} (database entry {command_index}, exit {:?}): {}",
@@ -327,33 +424,31 @@ fn ast_diagnostic(source: &SourceFile, command_index: usize, status: &AstDumpSta
             timeout.as_secs_f64(),
             fallback_message(stderr)
         ),
-        AstDumpStatus::Unavailable { message } => format!(
-            "Clang JSON AST unavailable for {} (database entry {command_index}): {message}",
-            source.relative
-        ),
+        _ => other_ast_status_message(source, command_index, status),
+    }
+}
+
+fn other_ast_status_message(source: &SourceFile, command_index: usize, status: &AstDumpStatus) -> String {
+    let subject = &source.relative;
+    match status {
+        AstDumpStatus::Unavailable { message } => {
+            format!("Clang JSON AST unavailable for {subject} (database entry {command_index}): {message}")
+        }
         AstDumpStatus::Rejected { message } => format!(
-            "refused unsafe Clang JSON AST command for {} (database entry {command_index}): {message}",
-            source.relative
+            "refused unsafe Clang JSON AST command for {subject} (database entry {command_index}): {message}"
         ),
         AstDumpStatus::OutputTooLarge { limit } => format!(
-            "Clang JSON AST for {} exceeded the {limit}-byte output limit (database entry {command_index})",
-            source.relative
+            "Clang JSON AST for {subject} exceeded the {limit}-byte output limit (database entry {command_index})"
         ),
         AstDumpStatus::InvalidJson { message } => format!(
-            "Clang returned invalid JSON AST for {} (database entry {command_index}): {message}",
-            source.relative
+            "Clang returned invalid JSON AST for {subject} (database entry {command_index}): {message}"
         ),
         AstDumpStatus::NotRun { message } => format!(
-            "Clang JSON AST was not run for {} (database entry {command_index}): {message}",
-            source.relative
+            "Clang JSON AST was not run for {subject} (database entry {command_index}): {message}"
         ),
-    };
-    Diagnostic {
-        severity: Severity::Error,
-        backend: "clang".to_string(),
-        message,
-        location: None,
-        fallback_used: false,
+        AstDumpStatus::Analyzed | AstDumpStatus::CommandFailed { .. } | AstDumpStatus::TimedOut { .. } => {
+            unreachable!("handled by ast_status_message")
+        }
     }
 }
 
@@ -365,43 +460,29 @@ fn fallback_message(value: &str) -> &str {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct FunctionKey {
-    file: String,
-    start_line: u32,
-    end_line: u32,
-    name: String,
-}
-
-impl From<&FunctionRecord> for FunctionKey {
-    fn from(record: &FunctionRecord) -> Self {
-        Self {
-            file: record.file.clone(),
-            start_line: record.start_line,
-            end_line: record.end_line,
-            name: record.name.clone(),
-        }
-    }
-}
-
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct AstNode {
-    #[serde(default)]
     id: Option<String>,
-    #[serde(default)]
     kind: String,
-    #[serde(default)]
     name: Option<String>,
-    #[serde(default)]
     opcode: Option<String>,
-    #[serde(default, rename = "parentDeclContextId")]
+    #[serde(rename = "type")]
+    type_info: Option<AstType>,
+    #[serde(rename = "mangledName")]
+    mangled_name: Option<String>,
+    #[serde(rename = "parentDeclContextId")]
     parent_context_id: Option<String>,
-    #[serde(default)]
     loc: Option<AstPoint>,
-    #[serde(default)]
     range: Option<AstRange>,
-    #[serde(default)]
     inner: Vec<Self>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct AstType {
+    #[serde(rename = "qualType")]
+    qualified: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -410,17 +491,16 @@ struct AstRange {
     end: AstPoint,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
+#[doc = "Raw Clang source location with spelling and expansion provenance."]
+#[serde(default)]
 struct AstPoint {
-    #[serde(default)]
     file: Option<String>,
-    #[serde(default)]
     line: Option<u64>,
-    #[serde(default)]
     offset: Option<u64>,
-    #[serde(default, rename = "spellingLoc")]
+    #[serde(rename = "spellingLoc")]
     spelling: Option<Box<Self>>,
-    #[serde(default, rename = "expansionLoc")]
+    #[serde(rename = "expansionLoc")]
     expansion: Option<Box<Self>>,
 }
 
@@ -465,20 +545,12 @@ fn extract_functions(
         records: Vec::new(),
     };
     extractor.visit(ast, &mut Vec::new());
-    extractor.records.sort_by(|left, right| {
-        (&left.file, left.start_line, left.end_line, &left.name).cmp(&(
-            &right.file,
-            right.start_line,
-            right.end_line,
-            &right.name,
-        ))
-    });
-    extractor.records.dedup_by(|left, right| {
-        left.file == right.file
-            && left.start_line == right.start_line
-            && left.end_line == right.end_line
-            && left.name == right.name
-    });
+    extractor
+        .records
+        .sort_by(reporigor_core::compare_function_records);
+    extractor
+        .records
+        .dedup_by(|left, right| left.file == right.file && left.stable_symbol == right.stable_symbol);
     extractor.records
 }
 
@@ -502,26 +574,13 @@ impl FunctionExtractor<'_> {
             return;
         }
         if is_function_kind(&node.kind) {
-            if let Some(record) = self.function_record(node, scope) {
-                self.records.push(record);
-            }
+            self.record_function(node, scope);
             // Local declarations and local-class methods are outside the
             // canonical file/module/type-owned function metric domain.
             return;
         }
 
-        let pushed = if is_scope_kind(&node.kind) {
-            node.name.as_ref().is_some_and(|name| {
-                if scope.last() == Some(name) {
-                    false
-                } else {
-                    scope.push(name.clone());
-                    true
-                }
-            })
-        } else {
-            false
-        };
+        let pushed = push_scope(node, scope);
         for child in &node.inner {
             self.visit(child, scope);
         }
@@ -530,28 +589,73 @@ impl FunctionExtractor<'_> {
         }
     }
 
+    fn record_function(&mut self, node: &AstNode, scope: &[String]) {
+        if let Some(record) = self.function_record(node, scope) {
+            self.records.push(record);
+        }
+    }
+
     fn function_record(&mut self, node: &AstNode, scope: &[String]) -> Option<FunctionRecord> {
         let body = node.inner.iter().find(|child| is_body_kind(&child.kind))?;
-        let raw_name = node.name.as_deref()?.trim();
-        if raw_name.is_empty() {
-            return None;
-        }
+        let location = self.function_location(node)?;
+        let name = self.function_name(scope, node)?;
+        let stable_symbol = structural_symbol(node, &name);
+        let mut record = FunctionRecord::new(
+            self.language.core_language(),
+            name,
+            location.relative,
+            location.start_line,
+            location.end_line,
+            1_u32.saturating_add(decision_count(body)),
+        );
+        record.stable_symbol = stable_symbol;
+        record.coverage_excluded_ranges = self.nested_coverage_ranges(body, &location.path);
+        Some(record)
+    }
+
+    fn function_location(&mut self, node: &AstNode) -> Option<FunctionLocation> {
         let path = self.function_path(node)?;
         let relative = path
             .strip_prefix(self.root)
             .ok()?
             .to_string_lossy()
             .replace('\\', "/");
+        let (start_line, end_line) = self.function_lines(node, &path);
+        Some(FunctionLocation {
+            path,
+            relative,
+            start_line,
+            end_line,
+        })
+    }
+
+    fn function_lines(&mut self, node: &AstNode, path: &Path) -> (u32, u32) {
         let range = node.range.as_ref();
-        let start_line = range
-            .and_then(|value| self.point_line(&value.begin, &path))
-            .or_else(|| node.loc.as_ref().and_then(|value| self.point_line(value, &path)))
+        let start = range
+            .and_then(|value| self.point_line(&value.begin, path))
+            .or_else(|| node.loc.as_ref().and_then(|value| self.point_line(value, path)))
             .unwrap_or(1);
-        let end_line = range
-            .and_then(|value| self.point_line(&value.end, &path))
-            .unwrap_or(start_line)
-            .max(start_line);
-        let contextual_scope = if scope.is_empty() {
+        let end = range
+            .and_then(|value| self.point_line(&value.end, path))
+            .unwrap_or(start)
+            .max(start);
+        (start, end)
+    }
+
+    fn function_name(&self, scope: &[String], node: &AstNode) -> Option<String> {
+        let raw_name = node.name.as_deref()?.trim();
+        if raw_name.is_empty() {
+            return None;
+        }
+        if raw_name.contains("::") {
+            return Some(raw_name.to_string());
+        }
+        let owner = self.contextual_scope(node, scope);
+        Some(owner.map_or_else(|| raw_name.to_string(), |owner| format!("{owner}::{raw_name}")))
+    }
+
+    fn contextual_scope(&self, node: &AstNode, scope: &[String]) -> Option<String> {
+        let owner = if scope.is_empty() {
             node.parent_context_id
                 .as_ref()
                 .and_then(|id| self.context_names.get(id))
@@ -559,43 +663,24 @@ impl FunctionExtractor<'_> {
         } else {
             Some(scope.join("::"))
         };
-        let name = if raw_name.contains("::") {
-            raw_name.to_string()
-        } else if let Some(owner) = contextual_scope.as_deref().filter(|owner| !owner.is_empty()) {
-            format!("{owner}::{raw_name}")
-        } else {
-            raw_name.to_string()
-        };
-        Some(FunctionRecord {
-            language: self.language.core_language(),
-            name,
-            file: relative,
-            start_line,
-            end_line,
-            complexity: 1_u32.saturating_add(decision_count(body)),
-            coverage: None,
-            crap: None,
-        })
+        owner.filter(|value| !value.is_empty())
+    }
+
+    fn nested_coverage_ranges(&mut self, root: &AstNode, path: &Path) -> Vec<(u32, u32)> {
+        let mut output = Vec::new();
+        collect_nested_ranges(self, root, path, &mut output);
+        output.sort_unstable();
+        output.dedup();
+        output
     }
 
     fn function_path(&self, node: &AstNode) -> Option<PathBuf> {
-        let location_file = node
+        let location = node
             .loc
             .as_ref()
             .and_then(AstPoint::file)
             .or_else(|| node.range.as_ref().and_then(|range| range.begin.file()));
-        let path = match location_file {
-            Some(file) if file.starts_with('<') => return None,
-            Some(file) => {
-                let path = Path::new(file);
-                if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    self.directory.join(path)
-                }
-            }
-            None => self.default_source.to_path_buf(),
-        };
+        let path = source_path(location, self.directory, self.default_source)?;
         let canonical = path.canonicalize().ok()?;
         canonical.strip_prefix(self.root).ok()?;
         Some(canonical)
@@ -606,75 +691,173 @@ impl FunctionExtractor<'_> {
             return u32::try_from(line).ok();
         }
         let offset = usize::try_from(point.offset()?).ok()?;
-        if !self.line_starts.contains_key(path) {
-            let remaining = MAX_AST_LINE_START_CACHE_BYTES.saturating_sub(self.line_start_cache_bytes);
-            let (starts, cache_bytes) = bounded_line_starts(self.root, path, remaining)?;
-            self.line_start_cache_bytes = self.line_start_cache_bytes.checked_add(cache_bytes)?;
-            self.line_starts.insert(path.to_path_buf(), starts);
-        }
+        self.ensure_line_starts(path)?;
         let starts = self.line_starts.get(path)?;
         u32::try_from(starts.partition_point(|start| *start <= offset)).ok()
     }
+
+    fn ensure_line_starts(&mut self, path: &Path) -> Option<()> {
+        if self.line_starts.contains_key(path) {
+            return Some(());
+        }
+        let remaining = MAX_AST_LINE_START_CACHE_BYTES.saturating_sub(self.line_start_cache_bytes);
+        let (starts, cache_bytes) = bounded_line_starts(self.root, path, remaining)?;
+        self.line_start_cache_bytes = self.line_start_cache_bytes.checked_add(cache_bytes)?;
+        self.line_starts.insert(path.to_path_buf(), starts);
+        Some(())
+    }
+}
+
+struct FunctionLocation {
+    path: PathBuf,
+    relative: String,
+    start_line: u32,
+    end_line: u32,
+}
+
+fn structural_symbol(node: &AstNode, name: &str) -> String {
+    let signature = node
+        .type_info
+        .as_ref()
+        .and_then(|value| value.qualified.as_deref())
+        .map(normalize_signature)
+        .filter(|value| !value.is_empty())
+        .or_else(|| node.mangled_name.clone());
+    signature.map_or_else(|| name.to_string(), |value| format!("{name}[type:{value}]"))
+}
+
+fn normalize_signature(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn collect_nested_ranges(
+    extractor: &mut FunctionExtractor<'_>,
+    node: &AstNode,
+    path: &Path,
+    output: &mut Vec<(u32, u32)>,
+) {
+    for child in &node.inner {
+        if is_executable_kind(&child.kind) {
+            push_nested_range(output, child, extractor, path);
+        } else {
+            collect_nested_ranges(extractor, child, path, output);
+        }
+    }
+}
+
+fn push_nested_range(
+    output: &mut Vec<(u32, u32)>,
+    node: &AstNode,
+    extractor: &mut FunctionExtractor<'_>,
+    path: &Path,
+) {
+    let Some(range) = node.range.as_ref() else {
+        return;
+    };
+    let Some(start) = extractor.point_line(&range.begin, path) else {
+        return;
+    };
+    let Some(end) = extractor.point_line(&range.end, path) else {
+        return;
+    };
+    output.push((start, end.max(start)));
+}
+
+fn is_executable_kind(kind: &str) -> bool {
+    is_function_kind(kind) || is_anonymous_function_kind(kind)
+}
+
+fn source_path(location: Option<&str>, directory: &Path, default_source: &Path) -> Option<PathBuf> {
+    let Some(file) = location else {
+        return Some(default_source.to_path_buf());
+    };
+    if file.starts_with('<') {
+        return None;
+    }
+    let path = Path::new(file);
+    Some(if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        directory.join(path)
+    })
 }
 
 fn bounded_line_starts(root: &Path, path: &Path, max_cache_bytes: usize) -> Option<(Vec<usize>, usize)> {
+    let file = bounded_ast_source(root, path)?;
+    let max_starts = maximum_line_starts(max_cache_bytes)?;
+    let starts = read_line_starts(file, max_starts)?;
+    let cache_bytes = starts.len().checked_mul(mem::size_of::<usize>())?;
+    Some((starts, cache_bytes))
+}
+
+fn bounded_ast_source(root: &Path, path: &Path) -> Option<File> {
     let canonical = path.canonicalize().ok()?;
     canonical.strip_prefix(root).ok()?;
-    let mut file = File::open(&canonical).ok()?;
+    let file = File::open(canonical).ok()?;
     let metadata = file.metadata().ok()?;
-    if !metadata.is_file() || metadata.len() > MAX_AST_LOCATION_SOURCE_BYTES {
-        return None;
-    }
+    (metadata.is_file() && metadata.len() <= MAX_AST_LOCATION_SOURCE_BYTES).then_some(file)
+}
 
-    let max_starts = max_cache_bytes.checked_div(mem::size_of::<usize>())?;
-    if max_starts == 0 {
-        return None;
-    }
+fn maximum_line_starts(max_cache_bytes: usize) -> Option<usize> {
+    let maximum = max_cache_bytes.checked_div(mem::size_of::<usize>())?;
+    (maximum > 0).then_some(maximum)
+}
+
+fn read_line_starts(mut file: File, maximum: usize) -> Option<Vec<usize>> {
     let mut starts = vec![0];
     let mut bytes_read = 0_u64;
     let mut buffer = [0_u8; 8 * 1024];
     let mut limited = file
         .by_ref()
         .take(MAX_AST_LOCATION_SOURCE_BYTES.saturating_add(1));
-    loop {
-        let count = limited.read(&mut buffer).ok()?;
-        if count == 0 {
-            break;
-        }
-        bytes_read = bytes_read.checked_add(u64::try_from(count).ok()?)?;
-        if bytes_read > MAX_AST_LOCATION_SOURCE_BYTES {
-            return None;
-        }
-        let chunk_start = bytes_read.checked_sub(u64::try_from(count).ok()?)?;
-        for (index, byte) in buffer[..count].iter().enumerate() {
-            if *byte == b'\n' {
-                if starts.len() >= max_starts {
-                    return None;
-                }
-                let start = chunk_start
-                    .checked_add(u64::try_from(index).ok()?)?
-                    .checked_add(1)?;
-                starts.push(usize::try_from(start).ok()?);
-            }
+    while let LineChunk::Data { count, chunk_start } =
+        read_line_chunk(&mut limited, &mut buffer, &mut bytes_read)?
+    {
+        append_line_starts(&buffer[..count], chunk_start, maximum, &mut starts)?;
+    }
+    Some(starts)
+}
+
+enum LineChunk {
+    End,
+    Data { count: usize, chunk_start: u64 },
+}
+
+fn read_line_chunk(reader: &mut impl Read, buffer: &mut [u8], bytes_read: &mut u64) -> Option<LineChunk> {
+    let count = reader.read(buffer).ok()?;
+    if count == 0 {
+        return Some(LineChunk::End);
+    }
+    let chunk_start = *bytes_read;
+    *bytes_read = bytes_read.checked_add(count as u64)?;
+    if *bytes_read > MAX_AST_LOCATION_SOURCE_BYTES {
+        return None;
+    }
+    Some(LineChunk::Data { count, chunk_start })
+}
+
+fn append_line_starts(chunk: &[u8], chunk_start: u64, maximum: usize, starts: &mut Vec<usize>) -> Option<()> {
+    for (index, byte) in chunk.iter().enumerate() {
+        if *byte == b'\n' {
+            append_line_start(index, chunk_start, maximum, starts)?;
         }
     }
-    let cache_bytes = starts.len().checked_mul(mem::size_of::<usize>())?;
-    Some((starts, cache_bytes))
+    Some(())
+}
+
+fn append_line_start(index: usize, chunk_start: u64, maximum: usize, starts: &mut Vec<usize>) -> Option<()> {
+    if starts.len() >= maximum {
+        return None;
+    }
+    let offset = chunk_start
+        .checked_add(u64::try_from(index).ok()?)?
+        .checked_add(1)?;
+    starts.push(usize::try_from(offset).ok()?);
+    Some(())
 }
 
 fn collect_context_names(node: &AstNode, scope: &mut Vec<String>, contexts: &mut BTreeMap<String, String>) {
-    let pushed = if is_scope_kind(&node.kind) {
-        node.name.as_ref().is_some_and(|name| {
-            if scope.last() == Some(name) {
-                false
-            } else {
-                scope.push(name.clone());
-                true
-            }
-        })
-    } else {
-        false
-    };
+    let pushed = push_scope(node, scope);
     if is_scope_kind(&node.kind) {
         if let Some(id) = &node.id {
             contexts.insert(id.clone(), scope.join("::"));
@@ -688,8 +871,22 @@ fn collect_context_names(node: &AstNode, scope: &mut Vec<String>, contexts: &mut
     }
 }
 
+fn push_scope(node: &AstNode, scope: &mut Vec<String>) -> bool {
+    match node
+        .name
+        .as_ref()
+        .filter(|name| is_scope_kind(&node.kind) && scope.last() != Some(*name))
+    {
+        Some(name) => {
+            scope.push(name.clone());
+            true
+        }
+        None => false,
+    }
+}
+
 fn is_function_kind(kind: &str) -> bool {
-    matches!(kind, "FunctionDecl" | "CXXMethodDecl" | "ObjCMethodDecl")
+    crate::word_list_contains(r"FunctionDecl CXXMethodDecl ObjCMethodDecl", kind)
 }
 
 fn is_anonymous_function_kind(kind: &str) -> bool {
@@ -697,22 +894,13 @@ fn is_anonymous_function_kind(kind: &str) -> bool {
 }
 
 fn is_body_kind(kind: &str) -> bool {
-    matches!(
-        kind,
-        "CompoundStmt" | "CXXTryStmt" | "CoroutineBodyStmt" | "SEHTryStmt"
-    )
+    ["CompoundStmt", "CXXTryStmt", "CoroutineBodyStmt", "SEHTryStmt"].contains(&kind)
 }
 
 fn is_scope_kind(kind: &str) -> bool {
-    matches!(
+    crate::word_list_contains(
+        r"NamespaceDecl CXXRecordDecl ClassTemplateSpecializationDecl ObjCInterfaceDecl ObjCImplementationDecl ObjCCategoryDecl ObjCCategoryImplDecl",
         kind,
-        "NamespaceDecl"
-            | "CXXRecordDecl"
-            | "ClassTemplateSpecializationDecl"
-            | "ObjCInterfaceDecl"
-            | "ObjCImplementationDecl"
-            | "ObjCCategoryDecl"
-            | "ObjCCategoryImplDecl"
     )
 }
 
@@ -727,39 +915,32 @@ fn decision_count(node: &AstNode) -> u32 {
 }
 
 fn is_decision_node(node: &AstNode) -> bool {
-    matches!(
-        node.kind.as_str(),
-        "IfStmt"
-            | "ForStmt"
-            | "WhileStmt"
-            | "DoStmt"
-            | "CXXForRangeStmt"
-            | "ObjCForCollectionStmt"
-            | "CaseStmt"
-            | "ConditionalOperator"
-            | "BinaryConditionalOperator"
-            | "CXXCatchStmt"
-            | "ObjCAtCatchStmt"
-            | "SEHExceptStmt"
+    crate::word_list_contains(
+        r"IfStmt ForStmt WhileStmt DoStmt CXXForRangeStmt ObjCForCollectionStmt CaseStmt ConditionalOperator BinaryConditionalOperator CXXCatchStmt ObjCAtCatchStmt SEHExceptStmt",
+        &node.kind,
     ) || (node.kind == "BinaryOperator" && matches!(node.opcode.as_deref(), Some("&&" | "||")))
 }
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{self, OpenOptions};
+    use std::fs::OpenOptions;
     use std::process::Command;
 
     use reporigor_core::Language;
-    use tempfile::tempdir;
 
     use super::*;
-    use crate::CommandOrigin;
+    use crate::{
+        test_support::{
+            compilation_entry, source_file, temp_dir, write, write_executable, write_file,
+            write_json_database,
+        },
+        CommandOrigin,
+    };
 
     fn fixture(extension: &str, language: ClangLanguage, json: &str) -> Vec<FunctionRecord> {
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
+        let temp = temp_dir();
         let source = temp.path().join(format!("sample.{extension}"));
-        fs::write(&source, "line1\nline2\nline3\nline4\nline5\n")
-            .unwrap_or_else(|error| panic!("write source: {error}"));
+        write(&source, "line1\nline2\nline3\nline4\nline5\n");
         let source = source
             .canonicalize()
             .unwrap_or_else(|error| panic!("canonical source: {error}"));
@@ -776,13 +957,7 @@ mod tests {
             output: None,
             origin: CommandOrigin::Arguments(arguments),
         };
-        let source_file = SourceFile {
-            path: source,
-            relative: format!("sample.{extension}"),
-            language: language.core_language(),
-            generated: false,
-            test: false,
-        };
+        let source_file = source_file(source, &format!("sample.{extension}"), language.core_language());
         let root = temp
             .path()
             .canonicalize()
@@ -790,15 +965,50 @@ mod tests {
         extract_functions(&ast, &root, &command, &source_file, language)
     }
 
+    fn analyze(adapter: &ClangAdapter, root: &Path) -> ClangAnalysis {
+        adapter
+            .analyze_project_with_provenance(&AnalysisRequest::new(root.to_path_buf()))
+            .unwrap_or_else(|error| panic!("analyze project: {error}"))
+    }
+
+    fn message_status(kind: &str, message: &str) -> AstDumpStatus {
+        match kind {
+            "unavailable" => AstDumpStatus::Unavailable {
+                message: message.to_string(),
+            },
+            "rejected" => AstDumpStatus::Rejected {
+                message: message.to_string(),
+            },
+            "invalid-json" => AstDumpStatus::InvalidJson {
+                message: message.to_string(),
+            },
+            _ => AstDumpStatus::NotRun {
+                message: message.to_string(),
+            },
+        }
+    }
+
+    fn write_ast_database(root: &Path, cases: &str) {
+        let entries = cases.lines().map(|case| ast_database_entry(root, case)).collect();
+        write_json_database(root, &serde_json::Value::Array(entries));
+    }
+
+    fn ast_database_entry(root: &Path, case: &str) -> serde_json::Value {
+        let Some((file, arguments)) = case.split_once('|') else {
+            panic!("invalid AST database fixture: {case}");
+        };
+        compilation_entry(root, Path::new(file), crate::test_support::owned_words(arguments))
+    }
+
     #[test]
     fn location_line_fallback_is_contained_and_size_bounded() {
-        let root = tempdir().unwrap_or_else(|error| panic!("root tempdir: {error}"));
+        let root = temp_dir();
         let canonical_root = root
             .path()
             .canonicalize()
             .unwrap_or_else(|error| panic!("canonical root: {error}"));
         let small = canonical_root.join("small.c");
-        fs::write(&small, b"one\ntwo\nthree").unwrap_or_else(|error| panic!("write small source: {error}"));
+        write(&small, b"one\ntwo\nthree");
         assert_eq!(
             bounded_line_starts(&canonical_root, &small, MAX_AST_LINE_START_CACHE_BYTES)
                 .map(|(starts, _cache_bytes)| starts),
@@ -825,10 +1035,8 @@ mod tests {
             None
         );
 
-        let outside = tempdir().unwrap_or_else(|error| panic!("outside tempdir: {error}"));
-        let outside_source = outside.path().join("outside.c");
-        fs::write(&outside_source, b"outside\n")
-            .unwrap_or_else(|error| panic!("write outside source: {error}"));
+        let outside = temp_dir();
+        let outside_source = write_file(outside.path(), "outside.c", b"outside\n");
         assert_eq!(
             bounded_line_starts(&canonical_root, &outside_source, MAX_AST_LINE_START_CACHE_BYTES),
             None
@@ -840,60 +1048,95 @@ mod tests {
     }
 
     #[test]
-    fn extracts_c_function_and_logical_decisions() {
-        let functions = fixture(
-            "c",
-            ClangLanguage::C,
-            r#"{
-                "kind":"TranslationUnitDecl",
-                "inner":[{
-                    "kind":"FunctionDecl","name":"check",
-                    "loc":{"line":1,"offset":0},
-                    "range":{"begin":{"line":1,"offset":0},"end":{"line":5,"offset":24}},
-                    "inner":[{"kind":"CompoundStmt","inner":[
-                        {"kind":"IfStmt","inner":[
-                            {"kind":"BinaryOperator","opcode":"&&"}
-                        ]}
-                    ]}]
-                }]
-            }"#,
+    fn extracts_supported_language_functions_and_decisions() {
+        let cases = [
+            (
+                "c",
+                ClangLanguage::C,
+                Language::C,
+                "check",
+                (1, 5),
+                r#"{"kind":"TranslationUnitDecl","inner":[{"kind":"FunctionDecl","name":"check","loc":{"line":1,"offset":0},"range":{"begin":{"line":1,"offset":0},"end":{"line":5,"offset":24}},"inner":[{"kind":"CompoundStmt","inner":[{"kind":"IfStmt","inner":[{"kind":"BinaryOperator","opcode":"&&"}]}]}]}]}"#,
+            ),
+            (
+                "cpp",
+                ClangLanguage::Cpp,
+                Language::Cpp,
+                "Widget::run",
+                (2, 5),
+                r#"{"kind":"TranslationUnitDecl","inner":[{"kind":"CXXRecordDecl","name":"Widget","inner":[{"kind":"CXXMethodDecl","name":"run","loc":{"line":2,"offset":6},"range":{"begin":{"line":2,"offset":6},"end":{"line":5,"offset":24}},"inner":[{"kind":"CompoundStmt","inner":[{"kind":"ForStmt"},{"kind":"ConditionalOperator"}]}]}]}]}"#,
+            ),
+            (
+                "m",
+                ClangLanguage::ObjectiveC,
+                Language::ObjectiveC,
+                "Controller::handle:",
+                (2, 5),
+                r#"{"kind":"TranslationUnitDecl","inner":[{"kind":"ObjCImplementationDecl","name":"Controller","inner":[{"kind":"ObjCMethodDecl","name":"handle:","loc":{"line":2,"offset":6},"range":{"begin":{"line":2,"offset":6},"end":{"line":5,"offset":24}},"inner":[{"kind":"CompoundStmt","inner":[{"kind":"ObjCForCollectionStmt"},{"kind":"ObjCAtCatchStmt"}]}]}]}]}"#,
+            ),
+        ];
+
+        for (extension, clang_language, language, name, lines, json) in cases {
+            let functions = fixture(extension, clang_language, json);
+            assert_eq!(functions.len(), 1);
+            assert_eq!(functions[0].language, language);
+            assert_eq!(functions[0].name, name);
+            assert_eq!(functions[0].complexity, 3);
+            assert_eq!((functions[0].start_line, functions[0].end_line), lines);
+        }
+    }
+
+    fn assert_overload_symbols(functions: &[FunctionRecord]) {
+        assert_eq!(functions.len(), 2);
+        assert_eq!(functions[0].name, functions[1].name);
+        assert_ne!(functions[0].stable_symbol, functions[1].stable_symbol);
+        assert!(functions
+            .iter()
+            .all(|function| !function.stable_symbol.contains("line")));
+    }
+
+    fn assert_nested_boundaries(functions: &[FunctionRecord]) {
+        let [function] = functions else {
+            panic!("nested executables leaked: {functions:?}");
+        };
+        assert_eq!(
+            (
+                function.name.as_str(),
+                function.complexity,
+                function.coverage_excluded_ranges.as_slice()
+            ),
+            ("outer", 2, &[(3, 4)][..])
         );
-        assert_eq!(functions.len(), 1);
-        assert_eq!(functions[0].language, Language::C);
-        assert_eq!(functions[0].name, "check");
-        assert_eq!(functions[0].complexity, 3);
-        assert_eq!((functions[0].start_line, functions[0].end_line), (1, 5));
     }
 
     #[test]
-    fn extracts_qualified_cpp_method_and_loop_decisions() {
-        let functions = fixture(
+    fn cpp_symbols_and_nested_complexity_boundaries_are_stable() {
+        let overloads = fixture(
             "cpp",
             ClangLanguage::Cpp,
             r#"{
                 "kind":"TranslationUnitDecl",
                 "inner":[{
-                    "kind":"CXXRecordDecl","name":"Widget","inner":[{
-                        "kind":"CXXMethodDecl","name":"run",
-                        "loc":{"line":2,"offset":6},
-                        "range":{"begin":{"line":2,"offset":6},"end":{"line":5,"offset":24}},
-                        "inner":[{"kind":"CompoundStmt","inner":[
-                            {"kind":"ForStmt"},
-                            {"kind":"ConditionalOperator"}
-                        ]}]
-                    }]
+                    "kind":"CXXRecordDecl","name":"Widget","inner":[
+                        {
+                            "kind":"CXXMethodDecl","name":"run","type":{"qualType":"int (int)"},
+                            "loc":{"line":1,"offset":0},
+                            "range":{"begin":{"line":1,"offset":0},"end":{"line":1,"offset":8}},
+                            "inner":[{"kind":"CompoundStmt"}]
+                        },
+                        {
+                            "kind":"CXXMethodDecl","name":"run","type":{"qualType":"int (double)"},
+                            "loc":{"line":1,"offset":18},
+                            "range":{"begin":{"line":1,"offset":18},"end":{"line":1,"offset":24}},
+                            "inner":[{"kind":"CompoundStmt"}]
+                        }
+                    ]
                 }]
             }"#,
         );
-        assert_eq!(functions.len(), 1);
-        assert_eq!(functions[0].language, Language::Cpp);
-        assert_eq!(functions[0].name, "Widget::run");
-        assert_eq!(functions[0].complexity, 3);
-    }
+        assert_overload_symbols(&overloads);
 
-    #[test]
-    fn cpp_lambdas_and_local_declarations_are_unreported_complexity_boundaries() {
-        let functions = fixture(
+        let nested = fixture(
             "cpp",
             ClangLanguage::Cpp,
             r#"{
@@ -904,7 +1147,7 @@ mod tests {
                     "range":{"begin":{"line":1,"offset":0},"end":{"line":5,"offset":24}},
                     "inner":[{"kind":"CompoundStmt","inner":[
                         {"kind":"IfStmt"},
-                        {"kind":"LambdaExpr","inner":[{
+                        {"kind":"LambdaExpr","range":{"begin":{"line":3,"offset":8},"end":{"line":4,"offset":16}},"inner":[{
                             "kind":"CXXRecordDecl","name":"(lambda)","inner":[{
                                 "kind":"CXXMethodDecl","name":"operator()","inner":[{
                                     "kind":"CompoundStmt","inner":[{"kind":"WhileStmt"}]
@@ -918,35 +1161,46 @@ mod tests {
                 }]
             }"#,
         );
-        assert_eq!(functions.len(), 1, "nested executables leaked: {functions:?}");
-        assert_eq!(functions[0].name, "outer");
-        assert_eq!(functions[0].complexity, 2);
+        assert_nested_boundaries(&nested);
     }
 
     #[test]
-    fn extracts_objective_c_method_and_collection_loop() {
-        let functions = fixture(
-            "m",
-            ClangLanguage::ObjectiveC,
-            r#"{
-                "kind":"TranslationUnitDecl",
-                "inner":[{
-                    "kind":"ObjCImplementationDecl","name":"Controller","inner":[{
-                        "kind":"ObjCMethodDecl","name":"handle:",
-                        "loc":{"line":2,"offset":6},
-                        "range":{"begin":{"line":2,"offset":6},"end":{"line":5,"offset":24}},
-                        "inner":[{"kind":"CompoundStmt","inner":[
-                            {"kind":"ObjCForCollectionStmt"},
-                            {"kind":"ObjCAtCatchStmt"}
-                        ]}]
-                    }]
-                }]
-            }"#,
+    fn ast_diagnostics_cover_every_provenance_status() {
+        let source = source_file("/project/source.c", "source.c", Language::C);
+        let mut statuses = vec![
+            AstDumpStatus::Analyzed,
+            AstDumpStatus::CommandFailed {
+                exit_code: Some(7),
+                stderr: String::new(),
+            },
+            AstDumpStatus::TimedOut {
+                timeout: Duration::from_millis(25),
+                stderr: "timeout detail".to_string(),
+            },
+            AstDumpStatus::OutputTooLarge { limit: 128 },
+        ];
+        statuses.extend(
+            "unavailable|missing compiler\nrejected|unsafe argument\ninvalid-json|bad json\nnot-run|not selected"
+                .lines()
+                .map(|case| {
+                    let (kind, message) = case.split_once('|').unwrap_or(("not-run", case));
+                    message_status(kind, message)
+                }),
         );
-        assert_eq!(functions.len(), 1);
-        assert_eq!(functions[0].language, Language::ObjectiveC);
-        assert_eq!(functions[0].name, "Controller::handle:");
-        assert_eq!(functions[0].complexity, 3);
+        let messages = statuses
+            .iter()
+            .map(|status| ast_diagnostic(&source, 3, status).message)
+            .collect::<Vec<_>>();
+
+        assert!(messages.iter().all(|message| message.contains("source.c")));
+        assert!(messages
+            .iter()
+            .any(|message| message.contains("no compiler diagnostics")));
+        assert!(messages.iter().any(|message| message.contains("128-byte")));
+        assert!(
+            std::panic::catch_unwind(|| other_ast_status_message(&source, 3, &AstDumpStatus::Analyzed))
+                .is_err()
+        );
     }
 
     #[test]
@@ -962,52 +1216,28 @@ mod tests {
             return;
         }
 
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        fs::write(
+        let temp = temp_dir();
+        write(
             temp.path().join("sample.c"),
             "int check(int a, int b) { if (a && b) return 1; return 0; }\n",
-        )
-        .unwrap_or_else(|error| panic!("write C source: {error}"));
-        fs::write(
+        );
+        write(
             temp.path().join("sample.cpp"),
             "class Widget { public: int run(int n); };\nint Widget::run(int n) { for (int i=0;i<n;i++) n--; return n > 0 ? 1 : 0; }\n",
-        )
-        .unwrap_or_else(|error| panic!("write C++ source: {error}"));
-        fs::write(
+        );
+        write(
             temp.path().join("sample.m"),
             "@interface Greeter\n- (int)choose:(int)x;\n@end\n@implementation Greeter\n- (int)choose:(int)x { if (x) return 1; return 0; }\n@end\n",
-        )
-        .unwrap_or_else(|error| panic!("write Objective-C source: {error}"));
-        let directory = serde_json::to_value(temp.path())
-            .unwrap_or_else(|error| panic!("serialize project path: {error}"));
-        let database = serde_json::json!([
-            {
-                "directory": directory,
-                "file": "sample.c",
-                "arguments": ["clang", "-c", "sample.c"]
-            },
-            {
-                "directory": directory,
-                "file": "sample.cpp",
-                "arguments": ["clang++", "-std=c++20", "-c", "sample.cpp"]
-            },
-            {
-                "directory": directory,
-                "file": "sample.m",
-                "arguments": ["clang", "-Wno-objc-root-class", "-c", "sample.m"]
-            }
-        ]);
-        fs::write(
-            temp.path().join("compile_commands.json"),
-            serde_json::to_vec(&database)
-                .unwrap_or_else(|error| panic!("serialize compilation database: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("write compilation database: {error}"));
+        );
+        write_ast_database(
+            temp.path(),
+            "sample.c|clang -c sample.c\nsample.cpp|clang++ -std=c++20 -c sample.cpp\nsample.m|clang -Wno-objc-root-class -c sample.m",
+        );
 
-        let analysis = ClangAdapter::default()
-            .with_timeout(Duration::from_secs(10))
-            .analyze_project_with_provenance(&AnalysisRequest::new(temp.path().to_path_buf()))
-            .unwrap_or_else(|error| panic!("analyze project: {error}"));
+        let analysis = analyze(
+            &ClangAdapter::default().with_timeout(Duration::from_secs(10)),
+            temp.path(),
+        );
         assert!(
             analysis
                 .translation_units
@@ -1017,56 +1247,40 @@ mod tests {
             analysis.translation_units
         );
         let functions = &analysis.snapshot.functions;
-        assert!(functions
+        let summaries = functions
             .iter()
-            .any(|function| function.name == "check" && function.complexity == 3));
-        assert!(functions.iter().any(|function| {
-            function.name == "Widget::run" && function.language == Language::Cpp && function.complexity == 3
-        }));
-        assert!(functions.iter().any(|function| {
-            function.name == "Greeter::choose:"
-                && function.language == Language::ObjectiveC
-                && function.complexity == 2
-        }));
+            .map(|function| {
+                format!(
+                    "{}|{:?}|{}",
+                    function.name, function.language, function.complexity
+                )
+            })
+            .collect::<Vec<_>>();
+        for expected in "check|C|3\nWidget::run|Cpp|3\nGreeter::choose:|ObjectiveC|2".lines() {
+            assert!(summaries.iter().any(|summary| summary == expected));
+        }
     }
 
     #[cfg(unix)]
     #[test]
     fn ast_timeout_retains_the_exact_invocation_and_diagnostic() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempdir().unwrap_or_else(|error| panic!("tempdir: {error}"));
-        fs::write(temp.path().join("sample.c"), "int check(void) { return 1; }\n")
-            .unwrap_or_else(|error| panic!("write source: {error}"));
+        let temp = temp_dir();
         let compiler = temp.path().join("fake-clang");
-        fs::write(
+        write_executable(
             &compiler,
-            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then echo 'fake clang 1.0'; exit 0; fi\nfor arg in \"$@\"; do if [ \"$arg\" = \"-ast-dump=json\" ]; then exec sleep 2; fi; done\nexit 0\n",
-        )
-        .unwrap_or_else(|error| panic!("write compiler: {error}"));
-        let mut permissions = fs::metadata(&compiler)
-            .unwrap_or_else(|error| panic!("compiler metadata: {error}"))
-            .permissions();
-        permissions.set_mode(0o755);
-        fs::set_permissions(&compiler, permissions)
-            .unwrap_or_else(|error| panic!("compiler permissions: {error}"));
-        let database = serde_json::json!([{
-            "directory": temp.path(),
-            "file": "sample.c",
-            "arguments": ["clang", "-c", "sample.c"]
-        }]);
-        fs::write(
-            temp.path().join("compile_commands.json"),
-            serde_json::to_vec(&database)
-                .unwrap_or_else(|error| panic!("serialize compilation database: {error}")),
-        )
-        .unwrap_or_else(|error| panic!("write compilation database: {error}"));
+            concat!(
+                "#!/bin/sh\n",
+                "if [ \"$1\" = \"--version\" ]; then echo 'fake clang 1.0'; exit 0; fi\n",
+                "for arg in \"$@\"; do if [ \"$arg\" = \"-ast-dump=json\" ]; then exec sleep 2; fi; done\n",
+                "exit 0\n",
+            ),
+        );
+        write(temp.path().join("sample.c"), "int check(void) { return 1; }\n");
+        write_ast_database(temp.path(), "sample.c|clang -c sample.c");
 
         let started = Instant::now();
-        let analysis = ClangAdapter::new(&compiler)
-            .with_timeout(Duration::from_millis(250))
-            .analyze_project_with_provenance(&AnalysisRequest::new(temp.path().to_path_buf()))
-            .unwrap_or_else(|error| panic!("analyze project: {error}"));
+        let adapter = ClangAdapter::new(&compiler).with_timeout(Duration::from_millis(250));
+        let analysis = analyze(&adapter, temp.path());
         assert!(started.elapsed() < Duration::from_millis(1500));
         assert_eq!(analysis.snapshot.parse_errors, 1);
         let unit = analysis

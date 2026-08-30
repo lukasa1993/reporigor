@@ -8,7 +8,9 @@ use std::path::{Path, PathBuf};
 #[cfg(windows)]
 use std::sync::mpsc;
 
-use reporigor_process_tree::{CleanupPolicy, ProcessTree, WaitReason};
+use reporigor_process_tree::{
+    CleanupPolicy, ProcessTree, SpawnError, TerminationReport, WaitOutcome, WaitReason,
+};
 #[cfg(unix)]
 use reporigor_process_tree::{CleanupStage, PollResult};
 
@@ -20,25 +22,116 @@ const WINDOWS_HELPER_READY_ENV: &str = "REPORIGOR_PROCESS_TREE_TEST_READY";
 const WINDOWS_HELPER_MARKER_ENV: &str = "REPORIGOR_PROCESS_TREE_TEST_MARKER";
 #[cfg(windows)]
 const WINDOWS_HELPER_TEST: &str = "windows_job_helper";
+#[cfg(unix)]
+const DIRECT_EXIT_WAIT: Duration = Duration::from_secs(2);
 
 fn fast_cleanup() -> CleanupPolicy {
-    CleanupPolicy {
-        graceful_timeout: Duration::from_millis(20),
-        kill_timeout: Duration::from_secs(2),
-        poll_interval: Duration::from_millis(5),
+    CleanupPolicy::new(
+        Duration::from_millis(20),
+        Duration::from_secs(2),
+        Duration::from_millis(5),
+    )
+}
+
+fn silence(command: &mut Command) {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+}
+
+#[cfg(unix)]
+fn unix_shell(script: &str) -> Command {
+    let mut command = Command::new("/bin/sh");
+    command.args(["-c", script]);
+    silence(&mut command);
+    command
+}
+
+#[cfg(unix)]
+fn marker_fixture(name: &str) -> Result<(tempfile::TempDir, std::path::PathBuf), std::io::Error> {
+    let directory = tempfile::tempdir()?;
+    let marker = directory.path().join(name);
+    Ok((directory, marker))
+}
+
+#[cfg(unix)]
+fn spawn_shell(script: &str) -> Result<ProcessTree, SpawnError> {
+    ProcessTree::spawn(&mut unix_shell(script))
+}
+
+#[cfg(unix)]
+fn stubborn_shell() -> Result<ProcessTree, SpawnError> {
+    spawn_shell("trap '' TERM; sleep 30")
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy)]
+enum MarkerScenario {
+    DirectExit,
+    Timeout,
+}
+
+#[cfg(unix)]
+fn marker_shell(
+    scenario: MarkerScenario,
+) -> Result<(tempfile::TempDir, std::path::PathBuf, Command), std::io::Error> {
+    let (name, script) = match scenario {
+        MarkerScenario::DirectExit => (
+            "leaked-after-exit",
+            "(trap '' HUP TERM; sleep 0.35; printf leaked > leaked-after-exit) & exit 7",
+        ),
+        MarkerScenario::Timeout => (
+            "leaked-after-timeout",
+            "trap '' TERM; (trap '' TERM; sleep 0.35; printf leaked > leaked-after-timeout) & wait",
+        ),
+    };
+    let (directory, marker) = marker_fixture(name)?;
+    let mut command = unix_shell(script);
+    command.current_dir(directory.path());
+    Ok((directory, marker, command))
+}
+
+fn assert_terminated(report: &TerminationReport) {
+    assert!(report.status.is_some());
+    assert!(report.tree_confirmed_gone);
+}
+
+fn assert_exited(outcome: &WaitOutcome, code: i32) {
+    assert_eq!(outcome.reason, WaitReason::Exited);
+    assert_eq!(outcome.status.code(), Some(code));
+    assert!(outcome.termination.tree_confirmed_gone);
+}
+
+fn assert_timed_out(outcome: &WaitOutcome, started: Instant) {
+    assert_eq!(outcome.reason, WaitReason::TimedOut);
+    assert!(outcome.termination.status.is_some());
+    assert!(outcome.termination.tree_confirmed_gone);
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+fn terminate_successfully(child: &mut ProcessTree) -> Result<(), Box<dyn std::error::Error>> {
+    let report = child.terminate_bounded(fast_cleanup())?;
+    assert_terminated(&report);
+    Ok(())
+}
+
+fn finish_marker_scenario(
+    marker: &std::path::Path,
+    delay: Duration,
+    message: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    std::thread::sleep(delay);
+    if marker.exists() {
+        return Err(message.to_owned().into());
     }
+    Ok(())
 }
 
 #[cfg(unix)]
 #[test]
 fn ordinary_fast_exit_without_descendants_is_not_a_cleanup_error() -> Result<(), Box<dyn std::error::Error>> {
-    let mut command = Command::new("/bin/sh");
-    command
-        .args(["-c", "exit 0"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = ProcessTree::spawn(&mut command)?;
+    let mut child = spawn_shell("exit 0")?;
     let outcome = child.wait_bounded(Duration::from_secs(2), fast_cleanup())?;
     assert_eq!(outcome.reason, WaitReason::Exited);
     assert!(outcome.status.success());
@@ -49,16 +142,10 @@ fn ordinary_fast_exit_without_descendants_is_not_a_cleanup_error() -> Result<(),
 #[cfg(unix)]
 #[test]
 fn observed_exit_does_not_pay_the_graceful_timeout() -> Result<(), Box<dyn std::error::Error>> {
-    let mut command = Command::new("/bin/sh");
-    command
-        .args(["-c", "exit 0"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
     let mut policy = fast_cleanup();
     policy.graceful_timeout = Duration::from_secs(3);
     let started = Instant::now();
-    let mut child = ProcessTree::spawn(&mut command)?;
+    let mut child = spawn_shell("exit 0")?;
     let outcome = child.wait_bounded(Duration::from_secs(2), policy)?;
     assert_eq!(outcome.reason, WaitReason::Exited);
     assert!(
@@ -70,74 +157,66 @@ fn observed_exit_does_not_pay_the_graceful_timeout() -> Result<(), Box<dyn std::
 
 #[cfg(unix)]
 #[test]
-fn direct_exit_cleans_background_descendants_before_status_is_exposed(
-) -> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::tempdir()?;
-    let marker = directory.path().join("leaked-after-exit");
-    let mut command = Command::new("/bin/sh");
-    command
-        .args([
-            "-c",
-            "(trap '' HUP TERM; sleep 0.35; printf leaked > leaked-after-exit) & exit 7",
-        ])
-        .current_dir(directory.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
-    let mut child = ProcessTree::spawn(&mut command)?;
-    let outcome = child.wait_bounded(Duration::from_secs(2), fast_cleanup())?;
-    assert_eq!(outcome.reason, WaitReason::Exited);
-    assert_eq!(outcome.status.code(), Some(7));
-    assert!(outcome.termination.tree_confirmed_gone);
-
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(!marker.exists(), "background descendant escaped cleanup");
-    Ok(())
+fn exit_and_timeout_both_clean_background_descendants() -> Result<(), Box<dyn std::error::Error>> {
+    assert_marker_scenario(MarkerScenario::DirectExit)?;
+    assert_marker_scenario(MarkerScenario::Timeout)
 }
 
 #[cfg(unix)]
-#[test]
-fn timeout_is_bounded_and_reaps_the_leader() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::tempdir()?;
-    let marker = directory.path().join("leaked-after-timeout");
-    let mut command = Command::new("/bin/sh");
-    command
-        .args([
-            "-c",
-            "trap '' TERM; (trap '' TERM; sleep 0.35; printf leaked > leaked-after-timeout) & wait",
-        ])
-        .current_dir(directory.path())
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-
+fn assert_marker_scenario(scenario: MarkerScenario) -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = marker_shell(scenario)?;
+    let (_directory, marker, mut command) = fixture;
     let started = Instant::now();
     let mut child = ProcessTree::spawn(&mut command)?;
-    let outcome = child.wait_bounded(Duration::from_millis(20), fast_cleanup())?;
-    assert_eq!(outcome.reason, WaitReason::TimedOut);
-    assert!(outcome.termination.status.is_some());
-    assert!(outcome.termination.tree_confirmed_gone);
-    assert!(started.elapsed() < Duration::from_secs(3));
-    assert!(matches!(
-        child.poll_exit(fast_cleanup())?,
-        PollResult::Exited(ref repeated) if repeated.reason == WaitReason::TimedOut
-    ));
+    let outcome = wait_for_marker_scenario(&mut child, scenario)?;
+    assert_marker_outcome(scenario, &mut child, &outcome, started)?;
+    finish_marker_scenario(
+        &marker,
+        Duration::from_millis(500),
+        "background descendant escaped cleanup",
+    )
+}
 
-    std::thread::sleep(Duration::from_millis(500));
-    assert!(!marker.exists(), "timed-out descendant escaped cleanup");
+#[cfg(unix)]
+fn wait_for_marker_scenario(
+    child: &mut ProcessTree,
+    scenario: MarkerScenario,
+) -> Result<WaitOutcome, Box<dyn std::error::Error>> {
+    match scenario {
+        MarkerScenario::DirectExit => child
+            .wait_bounded(DIRECT_EXIT_WAIT, fast_cleanup())
+            .map_err(Into::into),
+        MarkerScenario::Timeout => child
+            .wait_bounded(Duration::from_millis(20), fast_cleanup())
+            .map_err(Into::into),
+    }
+}
+
+#[cfg(unix)]
+fn assert_marker_outcome(
+    scenario: MarkerScenario,
+    child: &mut ProcessTree,
+    outcome: &WaitOutcome,
+    started: Instant,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match scenario {
+        MarkerScenario::DirectExit => assert_exited(outcome, 7),
+        MarkerScenario::Timeout => {
+            assert_timed_out(outcome, started);
+            assert!(matches!(
+                child.poll_exit(fast_cleanup())?,
+                PollResult::Exited(ref repeated) if repeated.reason == WaitReason::TimedOut
+            ));
+        }
+    }
     Ok(())
 }
 
 #[cfg(unix)]
 #[test]
 fn wait_slice_is_nonfinal_for_a_running_child() -> Result<(), Box<dyn std::error::Error>> {
-    let mut command = Command::new("/bin/sh");
-    command
-        .args(["-c", "trap '' TERM; sleep 30"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+    let mut command = unix_shell("trap '' TERM; sleep 30");
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
 
     let mut child = ProcessTree::spawn(&mut command)?;
     assert!(child.take_stdout().is_some());
@@ -146,27 +225,14 @@ fn wait_slice_is_nonfinal_for_a_running_child() -> Result<(), Box<dyn std::error
         child.wait_slice(Duration::from_millis(15), fast_cleanup())?,
         PollResult::Running
     ));
-    let report = child.terminate_bounded(fast_cleanup())?;
-    assert!(report.status.is_some());
-    assert!(report.tree_confirmed_gone);
-    Ok(())
+    terminate_successfully(&mut child)
 }
 
 #[cfg(unix)]
 #[test]
 fn cleanup_timeout_is_surfaced_and_a_later_call_can_reap() -> Result<(), Box<dyn std::error::Error>> {
-    let mut command = Command::new("/bin/sh");
-    command
-        .args(["-c", "trap '' TERM; sleep 30"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = ProcessTree::spawn(&mut command)?;
-    let zero_bound = CleanupPolicy {
-        graceful_timeout: Duration::ZERO,
-        kill_timeout: Duration::ZERO,
-        poll_interval: Duration::ZERO,
-    };
+    let mut child = stubborn_shell()?;
+    let zero_bound = CleanupPolicy::new(Duration::ZERO, Duration::ZERO, Duration::ZERO);
     let error = match child.terminate_bounded(zero_bound) {
         Ok(report) => return Err(format!("zero-bound cleanup unexpectedly succeeded: {report:?}").into()),
         Err(error) => error,
@@ -176,94 +242,107 @@ fn cleanup_timeout_is_surfaced_and_a_later_call_can_reap() -> Result<(), Box<dyn
         .iter()
         .any(|issue| issue.stage() == CleanupStage::ReapLeader));
 
-    let report = child.terminate_bounded(fast_cleanup())?;
-    assert!(report.status.is_some());
-    assert!(report.tree_confirmed_gone);
-    Ok(())
+    terminate_successfully(&mut child)
+}
+
+#[cfg(windows)]
+fn windows_child(script: &str) -> Result<ProcessTree, SpawnError> {
+    let mut command = Command::new("cmd.exe");
+    command.args(["/D", "/S", "/C", script]);
+    silence(&mut command);
+    ProcessTree::spawn(&mut command)
 }
 
 #[cfg(windows)]
 #[test]
 fn windows_job_returns_an_ordinary_exit() -> Result<(), Box<dyn std::error::Error>> {
-    let mut command = Command::new("cmd.exe");
-    command
-        .args(["/D", "/S", "/C", "exit 7"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    let mut child = ProcessTree::spawn(&mut command)?;
-    let outcome = child.wait_bounded(Duration::from_secs(5), fast_cleanup())?;
-    assert_eq!(outcome.reason, WaitReason::Exited);
-    assert_eq!(outcome.status.code(), Some(7));
-    assert!(outcome.termination.tree_confirmed_gone);
+    let mut child = windows_child("exit 7")?;
+    wait_for_exit(&mut child, Duration::from_secs(5), 7)?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn wait_for_exit(
+    child: &mut ProcessTree,
+    timeout: Duration,
+    code: i32,
+) -> Result<WaitOutcome, reporigor_process_tree::WaitError> {
+    let outcome = child.wait_bounded(timeout, fast_cleanup())?;
+    assert_exited(&outcome, code);
+    Ok(outcome)
 }
 
 #[cfg(windows)]
 #[test]
 fn windows_job_timeout_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
-    let mut command = Command::new("cmd.exe");
-    command
-        .args(["/D", "/S", "/C", "ping -n 30 127.0.0.1 >NUL"])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
     let started = Instant::now();
-    let mut child = ProcessTree::spawn(&mut command)?;
+    let mut child = windows_child("ping -n 30 127.0.0.1 >NUL")?;
     let outcome = child.wait_bounded(Duration::from_millis(25), fast_cleanup())?;
-    assert_eq!(outcome.reason, WaitReason::TimedOut);
-    assert!(outcome.termination.status.is_some());
-    assert!(outcome.termination.tree_confirmed_gone);
-    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_timed_out(&outcome, started);
     Ok(())
 }
 
 #[cfg(windows)]
-#[test]
-fn windows_leader_exit_closes_descendant_pipe_and_prevents_marker() -> Result<(), Box<dyn std::error::Error>>
-{
-    let directory = tempfile::tempdir()?;
-    let marker = directory.path().join("leaked-after-exit");
-    let ready = directory.path().join("descendant-ready");
-    let mut command = windows_helper_command("exit-leader", &ready, &marker)?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null());
-    let mut child = ProcessTree::spawn(&mut command)?;
-    let stdout = child
-        .take_stdout()
-        .ok_or("contained child stdout was unavailable")?;
-    let output_closed = spawn_pipe_reader(stdout);
-    wait_for_path(&ready, Duration::from_secs(2))?;
-    let outcome = child.wait_bounded(Duration::from_secs(5), fast_cleanup())?;
-    assert_eq!(outcome.reason, WaitReason::Exited);
-    assert_eq!(outcome.status.code(), Some(7));
-    let _captured = output_closed.recv_timeout(Duration::from_secs(2))??;
-    std::thread::sleep(Duration::from_millis(1_300));
-    assert!(!marker.exists(), "Job Object descendant wrote after cleanup");
-    Ok(())
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WindowsMarkerScenario {
+    Exit,
+    Timeout,
 }
 
 #[cfg(windows)]
 #[test]
-fn windows_timeout_kills_background_descendant_before_marker() -> Result<(), Box<dyn std::error::Error>> {
-    let directory = tempfile::tempdir()?;
-    let marker = directory.path().join("leaked-after-timeout");
-    let ready = directory.path().join("descendant-ready");
-    let mut command = windows_helper_command("timeout-leader", &ready, &marker)?;
-    command
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+fn windows_job_cleans_descendants_after_exit_and_timeout() -> Result<(), Box<dyn std::error::Error>> {
+    assert_windows_marker_scenario(WindowsMarkerScenario::Exit)?;
+    assert_windows_marker_scenario(WindowsMarkerScenario::Timeout)
+}
+
+#[cfg(windows)]
+fn assert_windows_marker_scenario(scenario: WindowsMarkerScenario) -> Result<(), Box<dyn std::error::Error>> {
+    let (role, marker_name) = match scenario {
+        WindowsMarkerScenario::Exit => ("exit-leader", "leaked-after-exit"),
+        WindowsMarkerScenario::Timeout => ("timeout-leader", "leaked-after-timeout"),
+    };
+    let (_directory, marker, ready, mut command) = windows_marker_fixture(role, marker_name)?;
+    if scenario == WindowsMarkerScenario::Exit {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+    } else {
+        silence(&mut command);
+    }
     let mut child = ProcessTree::spawn(&mut command)?;
+    let output_closed = child.take_stdout().map(spawn_pipe_reader);
     wait_for_path(&ready, Duration::from_secs(2))?;
-    let outcome = child.wait_bounded(Duration::from_millis(50), fast_cleanup())?;
-    assert_eq!(outcome.reason, WaitReason::TimedOut);
-    assert!(outcome.termination.tree_confirmed_gone);
-    std::thread::sleep(Duration::from_millis(1_300));
-    assert!(!marker.exists(), "Job Object descendant wrote after timeout");
-    Ok(())
+    match scenario {
+        WindowsMarkerScenario::Exit => {
+            wait_for_exit(&mut child, Duration::from_secs(5), 7)?;
+            let receiver = output_closed.ok_or("contained child stdout was unavailable")?;
+            let _captured = receiver.recv_timeout(Duration::from_secs(2))??;
+        }
+        WindowsMarkerScenario::Timeout => {
+            let outcome = child.wait_bounded(Duration::from_millis(50), fast_cleanup())?;
+            assert_eq!(outcome.reason, WaitReason::TimedOut);
+            assert!(outcome.termination.tree_confirmed_gone);
+        }
+    }
+    finish_marker_scenario(
+        &marker,
+        Duration::from_millis(1_300),
+        "Job Object descendant wrote after cleanup",
+    )
+}
+
+#[cfg(windows)]
+fn windows_marker_fixture(
+    role: &str,
+    marker_name: &str,
+) -> std::io::Result<(tempfile::TempDir, PathBuf, PathBuf, Command)> {
+    let directory = tempfile::tempdir()?;
+    let marker = directory.path().join(marker_name);
+    let ready = directory.path().join("descendant-ready");
+    let command = windows_helper_command(role, &ready, &marker)?;
+    Ok((directory, marker, ready, command))
 }
 
 #[cfg(windows)]

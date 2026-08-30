@@ -7,13 +7,13 @@
 
 | Field | Value |
 |---|---|
-| Last updated | 2026-08-27 |
-| Overall state | Dedicated RepoRigor package implemented, self-hosting, locally packaged, and fully verified; exhaustive parity, signing, and publication remain |
-| Active phase | Phase 7 — portable local package complete; multi-platform publication and compatibility completion remain |
+| Last updated | 2026-08-28 |
+| Overall state | Dedicated RepoRigor package implemented, self-hosting, and locally verified across six macOS/Linux targets; Developer ID signing and publication remain |
+| Active phase | Phase 7 — local six-target release flow complete; signing credentials and publication remain |
 | Target product | One `reporigor` CLI with `crap`, `dry`, `mutate`, and `check` commands |
 | Existing scope | 24 repositories: 3 analyzers × Bash, C, C++, Objective-C, Python, Rust, Swift, and TypeScript |
 | Canonical implementation | Local `reporigor/` Rust workspace and `https://github.com/lukasa1993/reporigor` |
-| Publication state | Public GitHub source repository created and `main` pushed; no tag, release, crate, installer, or package publication |
+| Publication state | Public GitHub source repository created and `main` pushed; no tag or binary release yet; local unsigned six-target candidates pass |
 
 Progress rules:
 
@@ -356,6 +356,8 @@ Acceptance gate:
 - [x] Configure and validate cargo-dist plans for x86-64/ARM64 Linux GNU and
   musl, Intel/ARM macOS, and x86-64 Windows.
 - [ ] Build signed binaries for the supported platforms.
+  Both macOS architectures and four Linux targets build and smoke-test locally;
+  public macOS signing awaits a Developer ID Application identity.
 - [x] Verify local Cargo installation and configure cargo-binstall release
   metadata. Publication remains pending.
 - [ ] Publish GitHub Releases and the Cargo/cargo-binstall installation paths.
@@ -367,8 +369,8 @@ Acceptance gate:
   migration guide. Configuration and migration guides are complete; completions
   and man pages remain.
 - [ ] Produce an SBOM, dependency/license audit, checksums, and provenance.
-  Dependency policy and checksummed build-only archives are implemented; SBOM,
-  signing, and provenance attestations remain.
+  Dependency policy, local build records, and checksummed archives are
+  implemented; SBOM and independently verifiable provenance remain.
 
 Acceptance gate:
 
@@ -475,6 +477,9 @@ The consolidation is complete only when:
 | 2026-08-27 | Preserve source metadata and reject multiply linked mutation targets | Byte restoration alone is insufficient; modes, timestamps, bounded extended attributes, checkout identity, and hard-link safety are part of the no-damage contract |
 | 2026-08-27 | Replace `quick-xml` with bounded `xml-rs` coverage ingestion | The fixed `quick-xml` line requires a newer compiler than the Rust 1.82 contract; the replacement plus linear preflight removes the advisories without weakening MSRV |
 | 2026-08-27 | Fail closed when discovery selects no source files | A successful empty report hides configuration and path mistakes; only standalone CRAP may opt in when coverage-only reporting is intentional |
+| 2026-08-28 | Build, sign, notarize, and publish releases only from the maintainer Mac | Keeps Apple credentials local, satisfies the requested no-CI/CD release path, and lets the exact release artifacts be smoke-tested before upload |
+| 2026-08-28 | Use static musl binaries for the no-toolchain Linux installer and also publish GNU variants | Static binaries maximize machine portability while GNU archives preserve native glibc and cargo-binstall target coverage |
+| 2026-08-28 | Require Developer ID Application plus Apple notarization for public macOS assets | Development/ad-hoc signatures do not establish outside-App-Store trust; the publisher rejects unsigned or merely development-signed archives |
 
 The exact-name availability check used the public searches for
 [crates.io](https://crates.io/search?q=reporigor),
@@ -668,11 +673,47 @@ clearance or a permanent reservation; publication must repeat the checks.
 - Added the canonical full repository URL to the copy-ready agent prompt so it
   remains self-contained when pasted outside this repository.
 
+### 2026-08-28 — local prebuilt release pipeline
+
+- Kept GitHub Actions as an explicitly manual, read-only build-candidate
+  workflow and removed its version-tag trigger; no signing key, notarization
+  credential, release permission, or publication step was added to CI/CD.
+- Added a local Apple Silicon release builder for Intel/ARM macOS and GNU/static
+  musl Linux on x86-64/ARM64. Linux builds use architecture-specific official
+  Rust 1.95.0 container images pinned by immutable manifest digest.
+- Built all six unsigned test archives locally. Native macOS, Rosetta, ARM64
+  Linux, and emulated x86-64 Linux extracted every archive and passed all 25
+  command-name smoke tests.
+- Added Developer ID signing with hardened runtime and timestamp, Apple
+  `notarytool` submission with an `Accepted` requirement, signature evidence,
+  and a publisher that refuses unsigned artifacts. This machine currently has
+  four Apple Development identities but no Developer ID Application identity,
+  so no public macOS artifact or release was produced.
+- Selected Picktek (`N43S8JF6JT`) as the release-signing team. Both the local
+  builder and publisher now reject otherwise-valid Developer ID signatures
+  issued for another Apple team.
+- Exercised Xcode 26.6's command-line automatic-signing path with a disposable
+  macOS archive and `-allowProvisioningUpdates`. Xcode reached Apple and
+  selected Picktek correctly, but Apple rejected Developer ID creation because
+  the configured account lacks cloud-managed distribution-certificate access.
+  No Picktek Developer ID identity, App Store Connect notarization key, or
+  `reporigor-notary` Keychain profile is currently available locally.
+- Added a checksum-verifying macOS/Linux installer that selects native macOS or
+  static Linux assets without Rust or another language runtime. Offline tests
+  passed on macOS plus minimal ARM64/x86-64 Alpine using BusyBox tooling.
+- Removed Apple extended attributes from generated archives, recorded exact
+  build inputs in `BUILDINFO.txt`, and generated adjacent plus aggregate SHA-256
+  manifests.
+- Ran RepoRigor against the expanded Rust and shell source tree; both dogfood
+  reports passed with zero findings, parse errors, or diagnostics.
+
 ## Next action
 
-Use the dedicated RepoRigor package for local trials, then finish exhaustive
-old-versus-new output parity and the remaining C-family/project-semantics cases.
-External mutation providers require disposable-checkout isolation before direct
-execution. Run the seven target builds in CI before publication; signing,
-SBOM/provenance, publication, and old-repository retirement remain separate
-explicit decisions.
+Grant the Xcode account access to Picktek's cloud-managed Developer ID
+certificates, then rerun the Xcode CLI provisioning/export path. Store the
+resulting Picktek (`N43S8JF6JT`) identity and a validated `reporigor-notary`
+profile in the local Keychain.
+Then run the clean signed six-target build and local publisher. After the first
+release, continue exhaustive old-versus-new output parity and remaining
+C-family/project-semantics work; external mutation execution still requires
+disposable-checkout isolation.

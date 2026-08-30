@@ -2,6 +2,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 
+use crate::path_io::CoreIoResult;
 use crate::CoreError;
 
 /// Maximum size accepted for repository-controlled manifests and configuration.
@@ -35,22 +36,38 @@ pub fn read_optional_bounded_utf8_file_within(
 /// Returns a typed error when either path cannot be inspected, the target is
 /// not a regular file, or the resolved target escapes `root`.
 pub fn resolve_optional_regular_file_within(root: &Path, path: &Path) -> Result<Option<PathBuf>, CoreError> {
-    match fs::symlink_metadata(path) {
-        Ok(_) => {}
-        Err(source) if source.kind() == ErrorKind::NotFound => return Ok(None),
-        Err(source) => {
-            return Err(CoreError::Read {
-                path: path.display().to_string(),
-                source,
-            });
-        }
+    if !path_exists(path)? {
+        return Ok(None);
     }
-    let canonical_root = canonical_root(root)?;
-    let canonical_path = path.canonicalize().map_err(|source| CoreError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    if !canonical_path.starts_with(&canonical_root) {
+    let canonical_path = resolve_contained_path(root, path)?;
+    validate_regular_path(path, &canonical_path)?;
+    Ok(Some(canonical_path))
+}
+
+fn path_exists(path: &Path) -> Result<bool, CoreError> {
+    Ok(optional_symlink_metadata(path)?.is_some())
+}
+
+pub(crate) fn optional_symlink_metadata(path: &Path) -> Result<Option<fs::Metadata>, CoreError> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => Ok(Some(metadata)),
+        Err(source) if source.kind() == ErrorKind::NotFound => Ok(None),
+        Err(source) => Err(CoreError::Read {
+            path: path.display().to_string(),
+            source,
+        }),
+    }
+}
+
+fn resolve_contained_path(root: &Path, path: &Path) -> Result<PathBuf, CoreError> {
+    let canonical_root = canonical_directory(root)?;
+    let canonical_path = path.canonicalize().for_read_path(path)?;
+    ensure_path_within(path, &canonical_path, &canonical_root)?;
+    Ok(canonical_path)
+}
+
+fn ensure_path_within(path: &Path, canonical_path: &Path, canonical_root: &Path) -> Result<(), CoreError> {
+    if !canonical_path.starts_with(canonical_root) {
         return Err(CoreError::UnsafePath {
             path: path.display().to_string(),
             message: format!(
@@ -60,17 +77,12 @@ pub fn resolve_optional_regular_file_within(root: &Path, path: &Path) -> Result<
             ),
         });
     }
-    let metadata = fs::metadata(&canonical_path).map_err(|source| CoreError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
-    if !metadata.is_file() {
-        return Err(CoreError::UnsafePath {
-            path: path.display().to_string(),
-            message: "expected a regular file".to_string(),
-        });
-    }
-    Ok(Some(canonical_path))
+    Ok(())
+}
+
+fn validate_regular_path(path: &Path, canonical_path: &Path) -> Result<(), CoreError> {
+    let metadata = fs::metadata(canonical_path).for_read_path(path)?;
+    reject_non_regular(path, &metadata)
 }
 
 /// Read a UTF-8 regular file after proving that it remains within `root` and
@@ -100,22 +112,18 @@ pub fn read_bounded_utf8_file_within(root: &Path, path: &Path, max_bytes: u64) -
 /// Returns a typed error when the path cannot be resolved, is not a regular
 /// file, is too large, cannot be read, or is not valid UTF-8.
 pub fn read_bounded_utf8_file(path: &Path, max_bytes: u64) -> Result<String, CoreError> {
-    let canonical_path = path.canonicalize().map_err(|source| CoreError::Read {
-        path: path.display().to_string(),
-        source,
-    })?;
+    let canonical_path = path.canonicalize().for_read_path(path)?;
     read_bounded_utf8_file_at(&canonical_path, path, max_bytes, None)
 }
 
-fn canonical_root(root: &Path) -> Result<PathBuf, CoreError> {
-    let canonical = root.canonicalize().map_err(|source| CoreError::Read {
-        path: root.display().to_string(),
-        source,
-    })?;
-    let metadata = fs::metadata(&canonical).map_err(|source| CoreError::Read {
-        path: root.display().to_string(),
-        source,
-    })?;
+/// Resolve a directory path to its canonical form and reject non-directories.
+///
+/// # Errors
+///
+/// Returns a typed read or invalid-root error when resolution fails.
+pub fn canonical_directory(root: &Path) -> Result<PathBuf, CoreError> {
+    let canonical = root.canonicalize().for_read_path(root)?;
+    let metadata = fs::metadata(&canonical).for_read_path(root)?;
     if !metadata.is_dir() {
         return Err(CoreError::InvalidRoot {
             path: root.display().to_string(),
@@ -131,57 +139,88 @@ fn read_bounded_utf8_file_at(
     max_bytes: u64,
     anchor_root: Option<&Path>,
 ) -> Result<String, CoreError> {
-    let path_metadata = fs::metadata(canonical_path).map_err(|source| CoreError::Read {
-        path: display_path.display().to_string(),
-        source,
-    })?;
-    reject_non_regular(display_path, &path_metadata)?;
-    reject_oversized(display_path, path_metadata.len(), max_bytes)?;
-    #[cfg(unix)]
-    let expected_identity = file_identity(&path_metadata);
-    #[cfg(not(unix))]
     let expected_identity =
-        same_file::Handle::from_path(canonical_path).map_err(|source| CoreError::Read {
-            path: display_path.display().to_string(),
-            source,
-        })?;
+        inspect_file_identity(FileIdentitySource::Path(canonical_path), display_path, max_bytes)?;
+    let file = open_for_bounded_read(canonical_path, anchor_root).for_read_path(display_path)?;
+    let opened_identity = inspect_file_identity(FileIdentitySource::Opened(&file), display_path, max_bytes)?;
+    ensure_unchanged_identity(display_path, &expected_identity, &opened_identity)?;
+    read_bounded_contents(file, display_path, max_bytes)
+}
 
-    let file = open_for_bounded_read(canonical_path, anchor_root).map_err(|source| CoreError::Read {
-        path: display_path.display().to_string(),
-        source,
-    })?;
-    let metadata = file.metadata().map_err(|source| CoreError::Read {
-        path: display_path.display().to_string(),
-        source,
-    })?;
-    reject_non_regular(display_path, &metadata)?;
-    reject_oversized(display_path, metadata.len(), max_bytes)?;
+#[derive(Clone, Copy)]
+enum FileIdentitySource<'a> {
+    Path(&'a Path),
+    Opened(&'a File),
+}
+
+fn inspect_file_identity(
+    source: FileIdentitySource<'_>,
+    display_path: &Path,
+    max_bytes: u64,
+) -> Result<FileIdentity, CoreError> {
+    source.inspect(display_path, max_bytes)
+}
+
+impl FileIdentitySource<'_> {
+    fn inspect(self, display_path: &Path, max_bytes: u64) -> Result<FileIdentity, CoreError> {
+        let metadata = self.metadata().for_read_path(display_path)?;
+        validate_bounded_metadata(display_path, &metadata, max_bytes)?;
+        #[cfg(unix)]
+        let identity = self.identity(display_path, &metadata);
+        #[cfg(not(unix))]
+        let identity = self.identity(display_path, &metadata)?;
+        Ok(identity)
+    }
+
+    fn metadata(self) -> std::io::Result<fs::Metadata> {
+        match self {
+            Self::Path(path) => fs::metadata(path),
+            Self::Opened(file) => file.metadata(),
+        }
+    }
+
     #[cfg(unix)]
-    let opened_identity = file_identity(&metadata);
+    fn identity(self, display_path: &Path, metadata: &fs::Metadata) -> FileIdentity {
+        let _ = (self, display_path);
+        file_identity(metadata)
+    }
+
     #[cfg(not(unix))]
-    let opened_identity =
-        same_file::Handle::from_file(file.try_clone().map_err(|source| CoreError::Read {
-            path: display_path.display().to_string(),
-            source,
-        })?)
-        .map_err(|source| CoreError::Read {
-            path: display_path.display().to_string(),
-            source,
-        })?;
+    fn identity(self, display_path: &Path, _metadata: &fs::Metadata) -> Result<FileIdentity, CoreError> {
+        match self {
+            Self::Path(path) => same_file::Handle::from_path(path).for_read_path(display_path),
+            Self::Opened(file) => {
+                let clone = file.try_clone().for_read_path(display_path)?;
+                same_file::Handle::from_file(clone).for_read_path(display_path)
+            }
+        }
+    }
+}
+
+fn validate_bounded_metadata(path: &Path, metadata: &fs::Metadata, max_bytes: u64) -> Result<(), CoreError> {
+    reject_non_regular(path, metadata)?;
+    reject_oversized(path, metadata.len(), max_bytes)
+}
+
+fn ensure_unchanged_identity(
+    display_path: &Path,
+    expected_identity: &FileIdentity,
+    opened_identity: &FileIdentity,
+) -> Result<(), CoreError> {
     if expected_identity != opened_identity {
         return Err(CoreError::UnsafePath {
             path: display_path.display().to_string(),
             message: "file changed while it was being opened".to_string(),
         });
     }
+    Ok(())
+}
 
+fn read_bounded_contents(file: File, display_path: &Path, max_bytes: u64) -> Result<String, CoreError> {
     let mut bytes = Vec::new();
     file.take(max_bytes.saturating_add(1))
         .read_to_end(&mut bytes)
-        .map_err(|source| CoreError::Read {
-            path: display_path.display().to_string(),
-            source,
-        })?;
+        .for_read_path(display_path)?;
     let observed_size = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
     reject_oversized(display_path, observed_size, max_bytes)?;
     String::from_utf8(bytes).map_err(|error| CoreError::Parse {
@@ -211,55 +250,87 @@ fn open_for_bounded_read(path: &Path, anchor_root: Option<&Path>) -> std::io::Re
 
 #[cfg(unix)]
 fn open_beneath(root: &Path, canonical_path: &Path) -> std::io::Result<File> {
-    use std::path::Component;
-
-    use rustix::fs::{open, openat, Mode, OFlags};
-
     let canonical_root = root.canonicalize()?;
-    let relative = canonical_path.strip_prefix(&canonical_root).map_err(|_| {
-        std::io::Error::new(
-            ErrorKind::PermissionDenied,
-            format!(
-                "{} is outside anchored root {}",
-                canonical_path.display(),
-                canonical_root.display()
-            ),
-        )
-    })?;
-    let components = relative
-        .components()
-        .map(|component| match component {
-            Component::Normal(name) => Ok(name),
-            _ => Err(std::io::Error::new(
-                ErrorKind::InvalidInput,
-                format!("unsafe relative path component in {}", relative.display()),
-            )),
+    let relative = anchored_relative_path(&canonical_root, canonical_path)?;
+    let components = normal_path_components(&relative)?;
+    reject_empty_metadata_path(&components)?;
+    open_component_chain(&canonical_root, &components)
+}
+
+#[cfg(unix)]
+fn anchored_relative_path(canonical_root: &Path, canonical_path: &Path) -> std::io::Result<PathBuf> {
+    canonical_path
+        .strip_prefix(canonical_root)
+        .map(Path::to_path_buf)
+        .map_err(|_| {
+            std::io::Error::new(
+                ErrorKind::PermissionDenied,
+                format!(
+                    "{} is outside anchored root {}",
+                    canonical_path.display(),
+                    canonical_root.display()
+                ),
+            )
         })
-        .collect::<Result<Vec<_>, _>>()?;
+}
+
+#[cfg(unix)]
+fn normal_path_components(relative: &Path) -> std::io::Result<Vec<std::ffi::OsString>> {
+    relative
+        .components()
+        .map(|component| normal_path_component(component, relative))
+        .collect()
+}
+
+#[cfg(unix)]
+fn normal_path_component(
+    component: std::path::Component<'_>,
+    relative: &Path,
+) -> std::io::Result<std::ffi::OsString> {
+    match component {
+        std::path::Component::Normal(name) => Ok(name.to_os_string()),
+        _ => Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("unsafe relative path component in {}", relative.display()),
+        )),
+    }
+}
+
+#[cfg(unix)]
+fn reject_empty_metadata_path(components: &[std::ffi::OsString]) -> std::io::Result<()> {
     if components.is_empty() {
         return Err(std::io::Error::new(
             ErrorKind::InvalidInput,
             "repository metadata path resolves to the project root",
         ));
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn open_component_chain(root: &Path, components: &[std::ffi::OsString]) -> std::io::Result<File> {
+    use rustix::fs::{open, openat, Mode, OFlags};
 
     let directory_flags =
         OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
     let file_flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC;
-    let mut descriptor = open(&canonical_root, directory_flags, Mode::empty())?;
+    let mut descriptor = open(root, directory_flags, Mode::empty())?;
     for (index, component) in components.iter().enumerate() {
         let flags = if index + 1 == components.len() {
             file_flags
         } else {
             directory_flags
         };
-        descriptor = openat(&descriptor, *component, flags, Mode::empty())?;
+        descriptor = openat(&descriptor, component, flags, Mode::empty())?;
     }
     Ok(File::from(descriptor))
 }
 
 #[cfg(unix)]
 type FileIdentity = (u64, u64);
+
+#[cfg(not(unix))]
+type FileIdentity = same_file::Handle;
 
 #[cfg(unix)]
 fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
@@ -299,36 +370,35 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    fn escaping_symlink_fixture(name: &str, contents: &str) -> (TempDir, TempDir, PathBuf) {
+        use std::os::unix::fs::symlink;
+
+        let (root, outside, target) = crate::path_io::external_test_file(name, contents);
+        let link = root.path().join(name);
+        symlink(&target, &link).unwrap_or_else(|error| panic!("symlink: {error}"));
+        (root, outside, link)
+    }
+
     #[test]
     fn sparse_oversized_file_is_rejected_before_reading() {
-        let root = TempDir::new().unwrap_or_else(|error| panic!("fixture: {error}"));
-        let path = root.path().join("package.json");
-        let file = File::create(&path).unwrap_or_else(|error| panic!("manifest: {error}"));
-        file.set_len(PROJECT_METADATA_MAX_BYTES + 1)
-            .unwrap_or_else(|error| panic!("sparse length: {error}"));
+        let (root, path) = crate::path_io::sparse_test_file("package.json", PROJECT_METADATA_MAX_BYTES + 1);
 
-        let Err(error) = read_bounded_utf8_file_within(root.path(), &path, PROJECT_METADATA_MAX_BYTES) else {
-            panic!("oversized fixture must be rejected");
-        };
-        assert!(matches!(error, CoreError::FileTooLarge { .. }));
+        crate::path_io::assert_core_error(
+            read_bounded_utf8_file_within(root.path(), &path, PROJECT_METADATA_MAX_BYTES),
+            crate::path_io::ExpectedCoreError::FileTooLarge,
+        );
     }
 
     #[cfg(unix)]
     #[test]
     fn symlink_escape_is_rejected() {
-        use std::os::unix::fs::symlink;
+        let (root, _outside, link) = escaping_symlink_fixture("package.json", "{}\n");
 
-        let root = TempDir::new().unwrap_or_else(|error| panic!("root: {error}"));
-        let outside = TempDir::new().unwrap_or_else(|error| panic!("outside: {error}"));
-        let target = outside.path().join("package.json");
-        fs::write(&target, "{}\n").unwrap_or_else(|error| panic!("target: {error}"));
-        let link = root.path().join("package.json");
-        symlink(&target, &link).unwrap_or_else(|error| panic!("symlink: {error}"));
-
-        let Err(error) = read_bounded_utf8_file_within(root.path(), &link, PROJECT_METADATA_MAX_BYTES) else {
-            panic!("escaping symlink must be rejected");
-        };
-        assert!(matches!(error, CoreError::UnsafePath { .. }));
+        crate::path_io::assert_core_error(
+            read_bounded_utf8_file_within(root.path(), &link, PROJECT_METADATA_MAX_BYTES),
+            crate::path_io::ExpectedCoreError::UnsafePath,
+        );
     }
 
     #[cfg(unix)]

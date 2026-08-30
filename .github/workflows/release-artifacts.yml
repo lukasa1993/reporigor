@@ -1,12 +1,10 @@
-name: Release artifacts (build only)
+name: Cross-platform artifacts (manual only)
 
 on:
-  push:
-    tags:
-      - "v*"
   workflow_dispatch:
 
-# This workflow intentionally cannot create a GitHub release or publish a crate.
+# This manual portability check cannot create a tag, sign an artifact, create a
+# GitHub Release, or publish a package. Production releases are built locally.
 permissions:
   contents: read
 
@@ -32,7 +30,7 @@ jobs:
         uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772
         with:
           toolchain: 1.95.0
-          components: clippy, rustfmt
+          components: clippy, rustfmt, llvm-tools-preview
 
       - name: Check tag matches package version
         if: github.ref_type == 'tag'
@@ -63,6 +61,9 @@ jobs:
 
       - name: Run workspace tests
         run: cargo test --workspace --all-targets --all-features --locked
+
+      - name: Install pinned coverage driver
+        run: cargo install cargo-llvm-cov --version 0.9.0 --locked
 
       - name: Dogfood RepoRigor against its own Rust and shell sources
         run: scripts/dogfood

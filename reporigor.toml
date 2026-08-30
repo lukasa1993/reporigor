@@ -1,0 +1,71 @@
+backend = "auto"
+include_tests = false
+allow_parse_errors = false
+max_source_bytes = 8388608
+
+[crap]
+fail_over = 6.0
+allow_missing_coverage = false
+# Dogfood fails closed: selected functions absent from the LLVM region export
+# are scored as 0% coverage rather than removed from the CRAP gate.
+unreported_as_zero = true
+allow_empty = false
+
+[dry]
+min_tokens = 30
+min_statements = 5
+similarity_threshold = 0.92
+# Dogfood intentionally uses a five-token shingle, one above the built-in
+# compatibility default, as a checked-in repository policy.
+shingle_tokens = 5
+max_groups = 50
+max_occurrences_per_window = 100
+max_total_windows = 1000000
+max_fingerprint_buckets = 500000
+max_candidate_work = 25000000
+fail = true
+
+[mutation]
+timeout_seconds = 120.0
+minimum_score = 1.0
+operators = ["boolean-literal", "comparison", "logical", "arithmetic"]
+seed = 76412026
+workers = 1
+# Dogfood executes this deterministic sample, which covers every fixed
+# operator while keeping the repository self-test bounded.
+max_mutants = 6
+
+[kiss]
+maximum_cyclomatic_complexity = 12
+maximum_nesting_depth = 5
+maximum_function_statements = 60
+maximum_parameters = 6
+maximum_module_dependencies = 16
+
+[yagni]
+maximum_unused_private_functions = 0
+maximum_unused_modules = 0
+maximum_unused_production_dependencies = 0
+maximum_unreachable_statements = 0
+maximum_unused_feature_flags = 0
+maximum_unreferenced_crate_exports = 0
+entry_points = ["main", "build.rs"]
+
+[architecture]
+maximum_module_fan_out = 12
+forbidden_edges = []
+domain_modules = []
+infrastructure_modules = []
+interface_modules = []
+implementation_modules = []
+contract_traits = []
+contract_test_marker = "reporigor_contract"
+
+[architecture.layers]
+
+[cohesion]
+minimum = 0.10
+
+[baseline]
+enabled = false
+path = "reporigor-baseline.json"
